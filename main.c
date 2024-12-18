@@ -10,15 +10,8 @@
 #include <sys/types.h>
 #include <sys/ioctl.h>
 
+#define ASSERT(Condition) do { if (!(Condition)) { perror(Error); exit(1); } } while (0)
 #define ASSERT_PERROR(Condition, Error) do { if (!(Condition)) { perror(Error); goto out; } } while (0)
-
-#define CTRL_A 0x01
-#define CTRL_B 0x02
-#define CTRL_C 0x03
-#define CTRL_D 0x04
-#define CTRL_L 0x0c
-#define CTRL_R 0x12
-#define BACKSPACE 0x7f
 
 /////////////
 // UTF-8
@@ -49,6 +42,35 @@ static int utf8_rsize(const unsigned char *s, size_t len) {
         return 0;
 
     return len - curr;
+}
+
+/**
+ * returns -1 on decoding error or zero/positive size.
+ */
+static ssize_t utf8_strnlen(const char *c, size_t n) {
+    size_t len = 0;
+    while (n && *c) {
+        int u8sz = utf8_size(*c);
+        if (u8sz < 1)
+            return -1; // continuation byte or invalid utf8
+        
+        if (u8sz > n)
+            return -1; // out-of-bounds
+        
+        for (int i = 1; i < u8sz; i++)
+            if ((c[i] &0xc0) != 0x80)
+                return -1; // not a continuation byte
+        
+        c += u8sz;
+        n -= u8sz;
+        len++;
+    }
+
+    return len;
+}
+
+static ssize_t utf8_strlen(const char *c) {
+    return utf8_strnlen(c, (size_t)-1);
 }
 
 /////////////
@@ -86,6 +108,14 @@ const char *history_get(size_t idx) {
  * 3. autocomplete
  */
 
+#define CTRL_A 0x01
+#define CTRL_B 0x02
+#define CTRL_C 0x03
+#define CTRL_D 0x04
+#define CTRL_L 0x0c
+#define CTRL_R 0x12
+#define BACKSPACE 0x7f
+
 #define VT_SCRCLR "\e[2J" // clear screen
 #define VT_CURSTR "\e7"   // save cursor position (\e[s] not supported by apple terminal)
 #define VT_CURLDR "\e8"   // restore cursor position (\e[u] not supported by apple terminal)
@@ -95,41 +125,113 @@ const char *history_get(size_t idx) {
 #define VT_CURFWD_N "\e[%dC" // move cursor N times forward
 #define VT_CURBCK_N "\e[%dD" // move cursor N times backward
 #define VT_CURSET_R "\e[%dd" // move cursor to row R
+#define VT_CURSET_C "\e[%dG" // move cursor to column C
 #define VT_CURSET_R_C "\e[%d;%dH"  // move cursor to row R column C
 
 #define PRMT_EXIT ((void *)-1)
 #define PRMT_ABRT ((void *)-2)
 
+#define PRMT_SRCH_TEXT   "(reverse-search)`': "
+#define PRMT_SRCH_TLEN   (sizeof(PRMT_SRCH_TEXT)-1)
+#define PRMT_SRCH_QSTART (PRMT_SRCH_TLEN-3)
+
 struct prompt {
+    const char *prmt_ps1;
+
     char  *prmt_line[HIST_MAX+1];
     size_t prmt_cur_row; // 0 is current line
     size_t prmt_cur_col;
 
-    char   prmt_u8char[4];
-    size_t prmt_u8curr;
-    size_t prmt_u8size;
+    char   *prmt_srch_line;
+    size_t  prmt_srch_line_sz;
+    size_t  prmt_srch_query_sz;
 };
 
-void prompt_reset(struct prompt *p) {
+void __prompt_reset(struct prompt *p, const char *ps1) {
     for (int i = 0; i < (HIST_MAX+1); i++)
         if (p->prmt_line[i])
             free(p->prmt_line[i]);
+    if (p->prmt_srch_line)
+        free(p->prmt_srch_line);
     memset(p, 0, sizeof(*p));
-    p->prmt_u8size = 1;
+    p->prmt_ps1 = ps1;
 }
 
-void prompt_resetchar(struct prompt *p) {
-    p->prmt_u8curr = 0;
+const char *__prompt_get(struct prompt *p, size_t idx) {
+    if (idx >= (1+HIST_MAX))
+        return NULL;
+    return p->prmt_line[idx] ?: (idx ? history_get(idx - 1) : NULL);
 }
 
 const char *prompt_get(struct prompt *p) {
-    return p->prmt_line[p->prmt_cur_row] ?: (p->prmt_cur_row ? history_get(p->prmt_cur_row - 1) : NULL);
+    return __prompt_get(p, p->prmt_cur_row);
 }
 
-const char *prompt_add(struct prompt *p, int c) {
+/**
+ * returns 0 on succes and adjusts `out_moves` by the amount of moves required
+ * returns -1 on error
+ * NOTE: this modifies the internal state of `p`, including cursor position
+ */
+int __prompt_search(struct prompt *p, size_t start_idx, const void *needle, size_t needle_len, size_t *out_moves) {
+    const char *s, *f;
+    size_t n;
+
+    size_t idx;
+    size_t pos;
+    int found = 0;
+
+    for (size_t i = start_idx; i < (1+HIST_MAX); i++) {
+        s = __prompt_get(p, i);
+        n = (s ? strlen(s) : 0);
+
+        if (n < needle_len)
+            continue;
+        
+        f = (const char *)memmem(s, n, needle, needle_len);
+        if (!f)
+            continue;
+        
+        idx = i;
+        pos = ((size_t)f) - (size_t)s;
+        found = 1;
+        break;
+    }
+
+    // not found, just return success without doing anything
+    if (!found)
+        return 0;
+
+    // find utf8-aware cursor position for the previous result and next result (so we know how to move it)
+    ssize_t nextlen = utf8_strnlen(s, pos);
+    ssize_t prevlen = utf8_strnlen(__prompt_get(p, p->prmt_cur_row), p->prmt_cur_col);
+    if (prevlen == -1 || nextlen == -1)
+        return -1; // invalid cursor position
+
+    // replace old result with new result in search line, and make sure is null terminated
+    if (!(p->prmt_srch_line = realloc(p->prmt_srch_line, PRMT_SRCH_TLEN + p->prmt_srch_query_sz + n + 1))) // +1 for \0
+        return -1;
+    memcpy(p->prmt_srch_line + PRMT_SRCH_TLEN + p->prmt_srch_query_sz, s, n);
+    p->prmt_srch_line[PRMT_SRCH_TLEN + p->prmt_srch_query_sz + n] = 0;
+    
+    p->prmt_cur_row = idx;
+    p->prmt_cur_col = pos;
+    *out_moves += nextlen - prevlen;
+    return 0;
+}
+
+int prompt_is_search(struct prompt *p) {
+    return !!(p->prmt_srch_line);
+}
+
+int prompt_add(struct prompt *p, int c, int *out_moves, const char **out_print) {
+    char *s;
+    const char *h;
+    size_t n;
+    int moves;
+
     int u8sz = utf8_size(c);
     if (-1 == u8sz)
-        return PRMT_ABRT;
+        return -1;
     if (u8sz == 1) {
         p->prmt_u8size = 1;
         p->prmt_u8char[0] = c;
@@ -137,55 +239,125 @@ const char *prompt_add(struct prompt *p, int c) {
     } else {
         if (!p->prmt_u8curr) {
             if (!u8sz)
-                return PRMT_ABRT; // continuation while not in mid-character
+                return -1; // continuation while not in mid-character
             p->prmt_u8size = u8sz;
             p->prmt_u8char[0] = c;
             p->prmt_u8curr = 1;
         } else {
             if (u8sz)
-                return PRMT_ABRT; // not continuation while in mid-character
+                return -1; // not continuation while in mid-character
             p->prmt_u8char[p->prmt_u8curr++] = c;
         }
 
-        if (p->prmt_u8curr < p->prmt_u8size)
-            return NULL;
+        if (p->prmt_u8curr < p->prmt_u8size) {
+            *out_moves = 0;
+            *out_print = NULL;
+            return 0;
+        }
         
         p->prmt_u8curr = 0; // reset curr + null terminator
     }
 
-    char *s = p->prmt_line[p->prmt_cur_row];
-    const char *h;
-    if (!s && p->prmt_cur_row && (h = history_get(p->prmt_cur_row - 1))) {
-        if (!(s = p->prmt_line[p->prmt_cur_row] = strdup(h)))
-            return PRMT_ABRT;
+    // reached here if we read a whole utf8 character into `prmt_u8char`
+
+    moves = 1;
+
+    if (p->prmt_srch_line) {
+
+        // active search
+
+        n = strlen(p->prmt_srch_line);
+        if (!(p->prmt_srch_line = realloc(p->prmt_srch_line, n + p->prmt_u8size + 1))) // 1 for \0
+            return -1;
+        s = p->prmt_srch_line + PRMT_SRCH_QSTART;
+        memmove(s + p->prmt_srch_qcnt + p->prmt_u8size, s + p->prmt_srch_qcnt, n - (PRMT_SRCH_QSTART + p->prmt_srch_qcnt));
+        memcpy(s + p->prmt_srch_qcnt, p->prmt_u8char, p->prmt_u8size);
+        p->prmt_srch_line[n + p->prmt_u8size] = 0;
+
+        p->prmt_srch_qcnt += p->prmt_u8size;
+
+        size_t idx, pos, curprev, curnext;
+        if (0 == __prompt_search(p, 0, s, p->prmt_srch_qcnt, &idx, &pos)) {
+            s = (char *)__prompt_get(p, idx);
+            n = strlen(s);
+            if (-1 == (curprev = utf8_strnlen(p->prmt_srch_line + PRMT_SRCH_TLEN + p->prmt_srch_qcnt, p->prmt_cur_col)))
+                return -1;
+            if (-1 == (curnext = utf8_strnlen(s, pos)))
+                return -1;
+            p->prmt_cur_row = idx;
+            p->prmt_cur_col = pos;
+            moves += ((ssize_t)curnext) - (size_t)curprev;
+
+            if (!(p->prmt_srch_line = realloc(p->prmt_srch_line, PRMT_SRCH_TLEN + p->prmt_srch_qcnt + n + 1))) // +1 for \0
+                return -1;
+            strcpy(p->prmt_srch_line + PRMT_SRCH_TLEN + p->prmt_srch_qcnt, s);
+            p->prmt_srch_line[PRMT_SRCH_TLEN + p->prmt_srch_qcnt + n] = 0;
+        }
+
+        *out_moves = moves;
+        *out_print = p->prmt_srch_line;
+        return 0;
+        
     }
 
-    size_t n = (s ? strlen(s) : 0);
+    // regular line
+
+    s = p->prmt_line[p->prmt_cur_row];
+    if (!s && p->prmt_cur_row && (h = history_get(p->prmt_cur_row - 1))) {
+        if (!(s = p->prmt_line[p->prmt_cur_row] = strdup(h)))
+            return -1;
+    }
+
+    n = (s ? strlen(s) : 0);
     s = p->prmt_line[p->prmt_cur_row] = realloc(s, n + p->prmt_u8size + 1); // 1 for \0
     if (!s)
-        return PRMT_ABRT;
+        return -1;
     
     memmove(s + p->prmt_cur_col + p->prmt_u8size, s + p->prmt_cur_col, n - p->prmt_cur_col);
     memcpy(s + p->prmt_cur_col, p->prmt_u8char, p->prmt_u8size);
     s[n + p->prmt_u8size] = 0;
 
     p->prmt_cur_col += p->prmt_u8size;
-    return s + p->prmt_cur_col - p->prmt_u8size;
+
+    *out_moves = moves;
+    *out_print = s;
+    return 0;
 }
 
 const char *prompt_backspace(struct prompt *p) {
+    char *s;
+    int del;
+
+    if (p->prmt_srch_line) {
+
+        // active search
+
+        if (!p->prmt_srch_qcnt)
+            return NULL;
+
+        s = p->prmt_srch_line + PRMT_SRCH_QSTART;
+        if (!(del = utf8_rsize((unsigned char *)s, p->prmt_srch_qcnt)))
+            return PRMT_ABRT;
+        
+        memmove(s + p->prmt_srch_qcnt - del, s + p->prmt_srch_qcnt, strlen(p->prmt_srch_line) - (PRMT_SRCH_QSTART + p->prmt_srch_qcnt) + 1); // +1 for \0
+        p->prmt_srch_qcnt -= del;
+
+        return p->prmt_srch_line;
+    }
+
+    // regular line
+
     if (!p->prmt_cur_col)
         return NULL;
     
-    char *s = p->prmt_line[p->prmt_cur_row];
+    s = p->prmt_line[p->prmt_cur_row];
     const char *h;
     if (!s && p->prmt_cur_row && (h = history_get(p->prmt_cur_row - 1))) {
         if (!(s = p->prmt_line[p->prmt_cur_row] = strdup(h)))
             return PRMT_ABRT;
     }
 
-    int del = utf8_rsize((unsigned char *)s, p->prmt_cur_col);
-    if (!del)
+    if (!(del = utf8_rsize((unsigned char *)s, p->prmt_cur_col)))
         return PRMT_ABRT;
     
     if (del > p->prmt_cur_col)
@@ -194,7 +366,7 @@ const char *prompt_backspace(struct prompt *p) {
     memmove(s + p->prmt_cur_col - del, s + p->prmt_cur_col, strlen(s) - p->prmt_cur_col + 1); // +1 for \0
     p->prmt_cur_col -= del;
 
-    return s + p->prmt_cur_col;
+    return s;
 }
 
 /**
@@ -223,6 +395,65 @@ const char *prompt_del(struct prompt *p) {
     
     memmove(s + p->prmt_cur_col, s + p->prmt_cur_col + del, n - p->prmt_cur_col + 1); // +1 for \0
     return s + p->prmt_cur_col;
+}
+
+int prompt_search(struct prompt *p, int *out_moves, const char **out_print) {
+    size_t n;
+    if (!p->prmt_srch_line) {
+
+        // no active search
+
+        const char *s_const = prompt_get(p);
+        n = (s_const ? strlen(s_const) : 0);
+
+        // initialize search line and return ps1diff
+
+        if (!(p->prmt_srch_line = malloc(PRMT_SRCH_TLEN + n + 1)))
+            return -1;
+        memcpy(p->prmt_srch_line, PRMT_SRCH_TEXT, PRMT_SRCH_TLEN);
+        memcpy(p->prmt_srch_line + PRMT_SRCH_TLEN, s_const, n);
+        p->prmt_srch_line[PRMT_SRCH_TLEN + n] = 0;
+
+        if (-1 == (p->prmt_srch_ps1diff = utf8_strlen(p->prmt_ps1)))
+            return -1;
+        p->prmt_srch_ps1diff = ((ssize_t)PRMT_SRCH_TLEN) - p->prmt_srch_ps1diff;
+
+        p->prmt_srch_qcnt = 0;
+
+        *out_moves = (int)p->prmt_srch_ps1diff;
+        *out_print = p->prmt_srch_line;
+        return 0;
+    }
+
+    // active search line
+
+    char *s = p->prmt_srch_line + PRMT_SRCH_QSTART;
+    size_t idx, pos, curprev, curnext;
+    int moves = 0;
+
+    if (((p->prmt_cur_row + 1) < (1+HIST_MAX)) &&
+        (0 == __prompt_search(p, p->prmt_cur_row + 1, s, p->prmt_srch_qcnt, &idx, &pos))) {
+
+        s = (char *)__prompt_get(p, idx);
+        n = strlen(s);
+        if (-1 == (curprev = utf8_strnlen(p->prmt_srch_line + PRMT_SRCH_TLEN + p->prmt_srch_qcnt, p->prmt_cur_col)))
+            return -1;
+        if (-1 == (curnext = utf8_strnlen(s, pos)))
+            return -1;
+        p->prmt_cur_row = idx;
+        p->prmt_cur_col = pos;
+        moves += ((ssize_t)curnext) - (size_t)curprev;
+
+        if (!(p->prmt_srch_line = realloc(p->prmt_srch_line, PRMT_SRCH_TLEN + p->prmt_srch_qcnt + n + 1))) // +1 for \0
+            return -1;
+        strcpy(p->prmt_srch_line + PRMT_SRCH_TLEN + p->prmt_srch_qcnt, s);
+        p->prmt_srch_line[PRMT_SRCH_TLEN + p->prmt_srch_qcnt + n] = 0;
+    }
+
+    *out_moves = moves;
+    *out_print = p->prmt_srch_line;
+
+    return 0;
 }
 
 /**
@@ -394,17 +625,462 @@ static void prompt_winch_sighandler(int signum, siginfo_t * siginfo, void * ucon
     prompt_winch = 1;
 }
 
-static const char *prompt(struct termios *termios_p, struct prompt *p)
+enum {
+    TCHTYPE_UNK = 0,
+    TCHTYPE_TEXT,
+    TCHTYPE_CTRL,
+};
+
+enum {
+    TCHCTRL_UNK = 0,
+
+    TCHCTRL_LINEKILL,
+    TCHCTRL_EXIT,
+    TCHCTRL_CLEAR,
+    TCHCTRL_ENTER,
+    TCHCTRL_TAB,
+    TCHCTRL_SEARCH,
+
+    TCHCTRL_DEL,
+    TCHCTRL_BACKSPACE,
+
+    TCHCTRL_HOME,
+    TCHCTRL_END,
+    TCHCTRL_BCKWARD,
+    TCHCTRL_FORWARD,
+
+    TCHCTRL_UP,
+    TCHCTRL_DN,
+    TCHCTRL_PGUP,
+    TCHCTRL_PGDN,
+};
+
+#define TCHSET_CTRL(TermCharPtr, Value) do { (TermCharPtr)->tch_type = TCHTYPE_CTRL; (TermCharPtr)->tch_ctrl.value = (Value); } while (0)
+
+struct __termchar {
+    uint8_t       tch_type; // TCHT_*
+    union {
+        struct {
+            unsigned char data[5];
+            uint8_t in;
+            uint8_t sz;
+        } tch_text;
+        struct {
+            struct {
+                unsigned char data[4];
+                uint8_t count;
+            } private;
+            uint8_t value;
+        } tch_ctrl;
+    };
+};
+
+/**
+ * returns: 1 on success, 0 if needs to read more or -1 on failure
+ */
+int __termchar_input(struct __termchar *termchar, int c)
+{
+    if (termchar->tch_type == TCHTYPE_UNK) {
+        if (c == '\e') {
+            termchar->tch_type = TCHTYPE_CTRL;
+            termchar->tch_ctrl.private.count = 0;
+            return 0; // read more data
+        }
+        if (c == CTRL_C) {
+            TCHSET_CTRL(termchar, TCHCTRL_LINEKILL);
+            return 1;
+        }
+        if (c == CTRL_D) {
+            TCHSET_CTRL(termchar, TCHCTRL_EXIT);
+            return 1;
+        }
+        if (c == CTRL_R) {
+            TCHSET_CTRL(termchar, TCHCTRL_SEARCH);
+            return 1;
+        }
+        if (c == CTRL_L) {
+            TCHSET_CTRL(termchar, TCHCTRL_CLEAR);
+            return 1;
+        }
+        if (c == '\n') {
+            TCHSET_CTRL(termchar, TCHCTRL_ENTER);
+            return 1;
+        }
+        if (c == '\t') {
+            TCHSET_CTRL(termchar, TCHCTRL_TAB);
+            return 1;
+        }
+        if (c == BACKSPACE) {
+            TCHSET_CTRL(termchar, TCHCTRL_BACKSPACE);
+            return 1;
+        }
+        
+        if (iscntrl(c))
+            return -1; // unknown control character
+        
+        termchar->tch_type = TCHTYPE_TEXT;
+        termchar->tch_text.data[0] = c;
+        termchar->tch_text.in = 1;
+
+        if ((termchar->tch_text.sz = utf8_size(c)) < 1)
+            return -1; // invalid utf8 starting char (either invalid or continuation
+        
+        if (termchar->tch_text.sz == 1)
+            return 1; // got a single-sized character, can exit
+        
+        return 0; // need more chars
+    }
+
+    if (termchar->tch_type == TCHTYPE_TEXT) {
+        if (termchar->tch_text.in >= termchar->tch_text.sz)
+            return -1; // cannot read anymore characters
+        
+        termchar->tch_text.data[termchar->tch_text.in++] = c;
+
+        if (termchar->tch_text.in == termchar->tch_text.sz) {
+            termchar->tch_text.data[termchar->tch_text.sz] = 0;
+            return 1; // finished reading
+        }
+
+        return 0; // `in < sz`, need more data
+    }
+
+    if (termchar->tch_type != TCHTYPE_CTRL)
+        return -1; // unknown tch_type
+    
+    // tch_type == TCHTYPE_CTRL
+
+    if (termchar->tch_ctrl.private.count == 0) {
+        if (c != '[' && c != 'O')
+            return -1; // invalid leading escape character
+        termchar->tch_ctrl.private.data[termchar->tch_ctrl.private.count++] = c;
+        return 0; // need more chars
+    }
+
+    if (termchar->tch_ctrl.private.data[0] == 'O') {
+        if (termchar->tch_ctrl.private.count != 1)
+            return -1; // may only have one more char after '\e0'
+        
+        if (c == 'H') {
+            termchar->tch_ctrl.value = TCHCTRL_HOME;
+            return 1;
+        }
+
+        if (c == 'F') {
+            termchar->tch_ctrl.value = TCHCTRL_END;
+            return 1;
+        }
+
+        return -1; // invalid control char after '\eO'
+    }
+
+    if (!termchar->tch_ctrl.private.data[0] != '[')
+        return -1; // invalid control char '\e'
+    
+    // termchar->tch_ctrl.private.data[0] == '['
+
+
+    if (termchar->tch_ctrl.private.count == 1) {
+        if (c >= '0' && c <= '9') {
+            termchar->tch_ctrl.private.data[termchar->tch_ctrl.private.count++] = c;
+            return 0; // numeric requires ending ~
+        }
+
+        if (c == 'A') {
+            termchar->tch_ctrl.value = TCHCTRL_UP;
+            return 1;
+        }
+        if (c == 'B') {
+            termchar->tch_ctrl.value = TCHCTRL_DN;
+            return 1;
+        }
+        if (c == 'C') {
+            termchar->tch_ctrl.value = TCHCTRL_FORWARD;
+            return 1;
+        }
+        if (c == 'D') {
+            termchar->tch_ctrl.value = TCHCTRL_BCKWARD;
+            return 1;
+        }
+        if (c == 'H') {
+            termchar->tch_ctrl.value = TCHCTRL_HOME;
+            return 1;
+        }
+        if (c == 'F') {
+            termchar->tch_ctrl.value = TCHCTRL_END;
+            return 1;
+        }
+
+        return -1; // invalid char after '\e['
+    }
+
+    if (termchar->tch_ctrl.private.count != 2)
+        return -1; // invalid amount of chars after '\e[%c'
+    
+    if (c != '~')
+        return -1; // invalid char after '\e[%c'
+    
+    // termchar->tch_ctrl.private.count == 2 && c == '~'
+
+    c = termchar->tch_ctrl.private.data[1];
+    if (c == '1') {
+        termchar->tch_ctrl.value = TCHCTRL_HOME;
+        return 1;
+    }
+    if (c == '3') {
+        termchar->tch_ctrl.value = TCHCTRL_DEL;
+        return 1;
+    }
+    if (c == '4') {
+        termchar->tch_ctrl.value = TCHCTRL_END;
+        return 1;
+    }
+    if (c == '5') {
+        termchar->tch_ctrl.value = TCHCTRL_PGUP;
+        return 1;
+    }
+    if (c == '6') {
+        termchar->tch_ctrl.value = TCHCTRL_PGDN;
+        return 1;
+    }
+    if (c == '7') {
+        termchar->tch_ctrl.value = TCHCTRL_HOME;
+        return 1;
+    }
+    if (c == '8') {
+        termchar->tch_ctrl.value = TCHCTRL_END;
+        return 1;
+    }
+
+    return -1; // invalid character between '\e[' and '~'
+}
+
+void __print_movecursor(int moves)
+{
+    if (moves > 0)
+        printf(VT_CURFWD_N, moves);
+    else if (moves < 0)
+        printf(VT_CURBCK_N, -moves);
+}
+
+/**
+ * if `buf=NULL`, same as `__print_movecursor(moves);`
+ * reprints the entire current line and moves the cursor afterwards
+ */
+void __print_redrawline(int ps1, const char *buf, int moves)
+{
+    if (!buf) {
+        __print_movecursor(moves);
+        return;
+    }
+    
+    if (!moves)
+        printf(VT_CURSTR VT_CURSET_C "%s%s" VT_CUREOL VT_CURLDR, 1, (ps1 ?: ""), buf);
+    else if (moves > 0)
+        printf(VT_CURSTR VT_CURSET_C "%s%s" VT_CUREOL VT_CURLDR VT_CURFWD_N, 1, (ps1 ?: ""), buf, moves);
+    else
+        printf(VT_CURSTR VT_CURSET_C "%s%s" VT_CUREOL VT_CURLDR VT_CURBCK_N, 1, (ps1 ?: ""), buf, -moves);
+}
+
+/**
+ * if `buf=NULL`, same as `__print_movecursor(moves_before + moves_after);`
+ * reprints data from cursor onwards to end of line.
+ * if moves is positive, moves cursor AFTER redrawing.
+ * if moves is negative, moves cursor BEFORE redrawing.
+ */
+void __print_redrawcursor(const char *buf, int moves_before, int moves_after)
+{
+    if (!buf) {
+        __print_movecursor(moves_before + moves_after);
+        return;
+    }
+
+    char moves_before_s[48] = {0};
+    char moves_after_s[48] = {0};
+
+    if (moves_before > 0)
+        sprintf(moves_before_s, VT_CURFWD_N, moves_before);
+    else if (moves_before < 0)
+        sprintf(moves_before_s, VT_CURBCK_N, -moves_before);
+    
+    if (moves_after > 0)
+        sprintf(moves_after_s, VT_CURFWD_N, moves_after);
+    else if (moves_after < 0)
+        sprintf(moves_after_s, VT_CURBCK_N, -moves_after);
+
+    printf("%s" VT_CURSTR VT_CUREOL "%s" VT_CURLDR "%s", moves_before_s, buf, moves_after_s);
+}
+
+/**
+ * returns 0 on success and non-zero on failure.
+ * NOTE: prints to screen.
+ */
+int __prompt_output_search(struct prompt *p, const char *s, size_t n)
+{
+    int moves = utf8_strnlen(s, n);
+    if (moves == -1)
+        return -1;
+    
+    // do nothing for empty string
+    if (!moves)
+        return -1;
+    
+    if (!(p->prmt_srch_line = realloc(p->prmt_srch_line, p->prmt_srch_line_sz + n + 1))) // 1 for \0
+        return -1;
+
+    // make room for new data in query
+    //  s = "text", n = 4
+    //  before: (reverse-search)`my': mydataisnice 
+    //  after:  (reverse-search)`my@@@@': mydataisnice 
+
+    memmove(p->prmt_srch_line + PRMT_SRCH_QSTART + p->prmt_srch_query_sz + n,
+            p->prmt_srch_line + PRMT_SRCH_QSTART + p->prmt_srch_query_sz,
+            p->prmt_srch_line_sz - (PRMT_SRCH_QSTART + p->prmt_srch_query_sz));
+
+    // copy new data
+    memcpy(p->prmt_srch_line + PRMT_SRCH_QSTART + p->prmt_srch_query_sz,
+           s,
+           n);
+    
+    // put null terminator and update line size
+    p->prmt_srch_line[p->prmt_srch_line_sz + n] = 0;
+    p->prmt_srch_line_sz += n;
+    p->prmt_srch_query_sz++;
+
+    if (0 != __prompt_search(p, 0, p->prmt_srch_line + PRMT_SRCH_QSTART, p->prmt_srch_query_sz, &moves))
+        return -1; // general failure while searching
+    
+    __print_redrawline(NULL, p->prmt_srch_line_sz, moves);
+}
+
+/**
+ * returns 0 on success and non-zero on failure
+ * NOTE: prints to screen.
+ */
+int __prompt_output_line(struct prompt *p, const char *s, size_t n)
+{
+    int moves = utf8_strnlen(s, n);
+    if (moves == -1)
+        return -1;
+    
+    // do nothing for empty string
+    if (!moves)
+        return -1;
+    
+    // if the current line is null and it isn't the initial line,
+    // it means we're on a history line, we want to copy it to the prompt lines
+    // because we never want to modify history.
+    const char *hist_line;
+    char *curr_line = p->prmt_line[p->prmt_cur_row];
+    if (!curr_line && p->prmt_cur_row && (hist_line = history_get(p->prmt_cur_row - 1))) // `-1` because prmt_line is `1+HIST_MAX`
+        if (!(curr_line = p->prmt_line[p->prmt_cur_row] = strdup(hist_line)))
+            return -1;
+
+    // resize line to be able to fit new data
+    size_t curr_line_sz = (curr_line ? strlen(curr_line) : 0);
+    curr_line = p->prmt_line[p->prmt_cur_row] = realloc(curr_line, curr_line_sz + n + 1); // 1 for \0
+    if (!curr_line)
+        return -1;
+    
+    // make room for new data, copy data to there and then put a null terminator
+    memmove(curr_line + p->prmt_cur_col + n, curr_line + p->prmt_cur_col, curr_line_sz - p->prmt_cur_col);
+    memcpy(curr_line + p->prmt_cur_col, s, n);
+    curr_line[curr_line_sz + n] = 0;
+
+    __print_redrawcursor(s, 0, moves);
+    p->prmt_cur_col += n;
+
+    return 0;
+}
+
+/**
+ * returns 0 on success and non-zero on failure
+ * NOTE: prints to screen.
+ */
+int __prompt_output_enter_search(struct prompt *p)
+{
+    if (p->prmt_srch_line)
+        return 0; // already in search, ignore
+    
+    const char *curr_line = __prompt_get(p, p->prmt_cur_row);
+    size_t curr_line_sz = (curr_line ? strlen(curr_line) : 0);
+
+    // initialize search line with searchbar and current line, put null terminator at the end
+    if (!(p->prmt_srch_line = malloc(PRMT_SRCH_TLEN + curr_line + 1))) // +1 for \0
+        return -1;
+    memcpy(p->prmt_srch_line, PRMT_SRCH_TEXT, PRMT_SRCH_TLEN);
+    memcpy(p->prmt_srch_line + PRMT_SRCH_TLEN, curr_line, curr_line_sz);
+    p->prmt_srch_line[PRMT_SRCH_TLEN + curr_line_sz] = 0;
+    p->prmt_srch_line_sz = PRMT_SRCH_TLEN + curr_line_sz;
+    p->prmt_srch_query_sz = 0;
+
+    // calculate cursor difference
+    int moves = utf8_strlen(p->prmt_ps1);
+    if (-1 == moves)
+        return -1;
+    moves = ((ssize_t)PRMT_SRCH_TLEN) - moves;
+
+    __print_redrawline(NULL, p->prmt_srch_line, moves);
+    return 0;
+}
+
+char *__prompt_output(struct prompt *p, struct __termchar *input, ssize_t (*autocomplete)(void *, char **), void *arg)
+{
+    int ret;
+    if (input->tch_type == TCHTYPE_TEXT) {
+        ret = (p->prmt_srch_line ? __prompt_output_search : __prompt_output_line)(p, input->tch_text.data, input->tch_text.sz);
+        return ret ? PRMT_ABRT : NULL;
+    }
+
+    if (input->tch_type != TCHTYPE_CTRL)
+        return PRMT_ABRT;
+    
+    // input->tch_type == TCHTYPE_CTRL
+
+    if (input->tch_ctrl.value == TCHCTRL_EXIT) {
+        putchar('\n');
+        return PRMT_EXIT;
+    }
+    
+    if (input->tch_ctrl.value == TCHCTRL_ENTER) {
+        putchar('\n');
+        return prompt_get(p);
+    }
+    
+    if (input->tch_ctrl.value == TCHCTRL_LINEKILL) {
+        putchar('\n');
+        return NULL;
+    }
+
+    if (input->tch_ctrl.value == TCHCTRL_SEARCH) {
+        ret = (p->prmt_srch_line ? __prompt_output_next_search : __prompt_output_enter_search)(p);
+        return ret ? PRMT_ABRT : NULL;
+    }
+
+    if (input->tch_ctrl.value == TCHCTRL_BACKSPACE) {
+
+    }
+
+    return PRMT_ABRT;
+}
+
+const char *prompt(struct prompt *p, struct termios *termios_p, ssize_t (*autocomplete)(void *, char **), void *arg)
 {
     const char *ret = PRMT_ABRT;
     struct termios raw_termios;
     struct winsize winsz;
     struct sigaction winch_act, winch_oldact;
     int set_act = 0;
+    
+    char *ps1;
 
     int c;
     int moves;
     const char *buf;
+    const char *draw_ps1;
+
+    struct __termchar termchar;
+    int termchar_ret;
 
     prompt_winch = 1;
 
@@ -414,172 +1090,206 @@ static const char *prompt(struct termios *termios_p, struct prompt *p)
     raw_termios.c_lflag &= ~(ECHO | ICANON | ISIG | IEXTEN);
     ASSERT_PERROR(tcsetattr(STDIN_FILENO, TCSADRAIN, &raw_termios) == 0, "tcsetattr");
 
-    //ASSERT_PERROR(ioctl(STDIN_FILENO, TIOCGWINSZ, &winsz) == 0, "ioctl(TIOCGWINSZ)");
-
     winch_act.sa_flags = SA_SIGINFO;
     winch_act.sa_sigaction = prompt_winch_sighandler;
     ASSERT_PERROR(sigaction(SIGWINCH, &winch_act, &winch_oldact) == 0, "sigaction");
     set_act = 1;
 
 retry:
-    prompt_reset(p);
-
-    // print prompt
-    char *ps1 = getenv("PS1");
-    if (ps1)
-        {}
-    else if (!getuid())
-        ps1 = "# ";
-    else
-        ps1 = "$ ";
+    ps1 = (getenv("PS1") ?: (getuid() ? "$ " : "# "));
     fputs(ps1, stdout);
 
-    while (1)
+    __prompt_reset(p, ps1);
+
+    ret = NULL;
+    while (!ret)
     {
-        GETCHAR(c);
-        
-        if (c == CTRL_D) {
-            ret = PRMT_EXIT;
-            putchar('\n');
-            goto out;
+        memset(&termchar, 0, sizeof(termchar));
+
+        do {
+            GETCHAR(c);
         }
+        while (0 == (termchar_ret = __termchar_input(p, c)));
 
-        if (c == '\n')
-            break;
+        if (c == '\0')
+            goto out; // EOF
+
+        if (-1 == termchar_ret)
+            continue; // ignore invalid input
         
-        if (c == CTRL_C) {
-            ECHO_CNTRL(c);
-            putchar('\n');
-            goto retry;
-        }
+        // termchar_ret == 1
 
-        if (c == BACKSPACE)
-            goto backspace;
-        
-        if (c == CTRL_L)
-            goto clear_screen;
-
-        if (c == '\033') {
-            int c2;
-            GETCHAR(c2);
-            if (c2 == '[') {
-                int c3;
-                GETCHAR(c3);
-                if (c3 >= '0' && c3 <= '9') {
-                    int c4;
-                    GETCHAR(c4);
-                    if (c4 == '~') {
-                        if (c3 == '1')
-                            goto home;
-                        else if (c3 == '3')
-                            goto del;
-                        else if (c3 == '4')
-                            goto end;
-                        else if (c3 == '5')
-                            {printf("\npgup\n");goto retry;}
-                        else if (c3 == '6')
-                            {printf("\npgdn\n");goto retry;}
-                        else if (c3 == '7')
-                            goto home;
-                        else if (c3 == '8')
-                            goto end;
-                    }
-                }
-                else if (c3 == 'A')
-                    goto up;
-                else if (c3 == 'B')
-                    goto down;
-                else if (c3 == 'D')
-                    goto left;
-                else if (c3 == 'C')
-                    goto right;
-                else if (c3 == 'H')
-                    goto home;
-                else if (c3 == 'F')
-                    goto end;
-            }
-            else if (c2 == 'O') {
-                int c3;
-                GETCHAR(c3);
-                if (c3 == 'H')
-                    goto home;
-                else if (c3 == 'F')
-                    goto end;
-
-            }
-        }
-        
-        if (!iscntrl(c))
-            goto add;
-
-        continue;
-
-    add:
-        if (PRMT_ABRT == (buf = prompt_add(p, c)))
-            goto out;
-        if (buf)
-            printf(VT_CURSTR VT_CUREOL "%s" VT_CURLDR VT_CURFWD, buf);
-        continue;
-
-    backspace:
-        if (PRMT_ABRT == (buf = prompt_backspace(p)))
-            goto out;
-        if (buf)
-            printf(VT_CURBCK VT_CURSTR VT_CUREOL "%s" VT_CURLDR, buf);
-        continue;
-
-    del:
-        if (PRMT_ABRT == (buf = prompt_del(p)))
-            goto out;
-        if (buf)
-            printf(VT_CURSTR VT_CUREOL "%s" VT_CURLDR, buf);
-        continue;
-    
-    clear_screen:
-        printf(VT_CURSTR VT_SCRCLR VT_CURSET_R_C "%s%s" VT_CURLDR VT_CURSET_R, 1, 1, ps1, prompt_get(p) ?: "", 1);
-        continue;
-
-    left:
-        moves = prompt_seekl(p);
-        goto curbck;
-    home:
-        moves = prompt_home(p);
-    curbck:
-        if (moves == -1)
-            goto out;
-        if (moves > 0)
-            printf(VT_CURBCK_N, moves);
-        continue;
-    
-    right:
-        moves = prompt_seekr(p);
-        goto curfwd;
-    end:
-        moves = prompt_end(p);
-    curfwd:
-        if (-1 == moves)
-            goto out;
-        if (moves > 0)
-            printf(VT_CURFWD_N, moves);
-        continue;
-    
-    up:
-        moves = prompt_up(p, &buf);
-        goto set_line;
-    down:
-        moves = prompt_down(p, &buf);
-    set_line:
-        if (moves > 0 && buf)
-            printf(VT_CURBCK_N VT_CUREOL "%s", moves, buf);
-        else if (moves > 0)
-            printf(VT_CURBCK_N VT_CUREOL, moves);
-        else if (buf)
-            printf(VT_CUREOL "%s", buf);
-        continue;
+        ret = __prompt_output(p, &termchar, autocomplete, arg);
     }
-    putchar('\n');
+        
+    //     if (c == CTRL_D) {
+    //         ret = PRMT_EXIT;
+    //         putchar('\n');
+    //         goto out;
+    //     }
 
-    ret = prompt_get(p);
+    //     if (c == '\n')
+    //         break;
+        
+    //     if (c == CTRL_C) {
+    //         ECHO_CNTRL(c);
+    //         putchar('\n');
+    //         goto retry;
+    //     }
+
+    //     if (c == CTRL_R)
+    //         goto search;
+
+    //     if (c == BACKSPACE)
+    //         goto backspace;
+        
+    //     if (c == CTRL_L)
+    //         goto clear_screen;
+
+    //     if (c == '\t')
+    //         goto tab;
+
+    //     if (c == '\033') {
+    //         int c2;
+    //         GETCHAR(c2);
+    //         if (c2 == '[') {
+    //             int c3;
+    //             GETCHAR(c3);
+    //             if (c3 >= '0' && c3 <= '9') {
+    //                 int c4;
+    //                 GETCHAR(c4);
+    //                 if (c4 == '~') {
+    //                     if (c3 == '1')
+    //                         goto home;
+    //                     else if (c3 == '3')
+    //                         goto del;
+    //                     else if (c3 == '4')
+    //                         goto end;
+    //                     else if (c3 == '5')
+    //                         {printf("\npgup\n");goto retry;}
+    //                     else if (c3 == '6')
+    //                         {printf("\npgdn\n");goto retry;}
+    //                     else if (c3 == '7')
+    //                         goto home;
+    //                     else if (c3 == '8')
+    //                         goto end;
+    //                 }
+    //             }
+    //             else if (c3 == 'A')
+    //                 goto up;
+    //             else if (c3 == 'B')
+    //                 goto down;
+    //             else if (c3 == 'D')
+    //                 goto left;
+    //             else if (c3 == 'C')
+    //                 goto right;
+    //             else if (c3 == 'H')
+    //                 goto home;
+    //             else if (c3 == 'F')
+    //                 goto end;
+    //         }
+    //         else if (c2 == 'O') {
+    //             int c3;
+    //             GETCHAR(c3);
+    //             if (c3 == 'H')
+    //                 goto home;
+    //             else if (c3 == 'F')
+    //                 goto end;
+
+    //         }
+    //     }
+        
+    //     if (!iscntrl(c))
+    //         goto add;
+
+    //     continue;
+
+    // add:
+    //     if (0 != prompt_add(p, c, &moves, &buf))
+    //         goto out;
+    //     goto redraw_line;
+
+    // backspace:
+    //     if (PRMT_ABRT == (buf = prompt_backspace(p)))
+    //         goto out;
+        
+    //     moves = (buf ? -1 : 0);
+    //     goto redraw_line;
+
+    // del:
+    //     if (PRMT_ABRT == (buf = prompt_del(p)))
+    //         goto out;
+    //     if (buf)
+    //         printf(VT_CURSTR VT_CUREOL "%s" VT_CURLDR, buf);
+    //     continue;
+    
+    // clear_screen:
+    //     printf(VT_CURSTR VT_SCRCLR VT_CURSET_R_C "%s%s" VT_CURLDR VT_CURSET_R, 1, 1, ps1, prompt_get(p) ?: "", 1);
+    //     continue;
+
+    // search:
+    //     if (0 != prompt_search(p, &moves, &buf))
+    //         goto out;
+    //     goto redraw_line;
+
+    // tab:
+
+
+    // left:
+    //     moves = prompt_seekl(p);
+    //     goto curbck;
+    // home:
+    //     moves = prompt_home(p);
+    // curbck:
+    //     if (moves == -1)
+    //         goto out;
+    //     if (moves > 0)
+    //         printf(VT_CURBCK_N, moves);
+    //     continue;
+    
+    // right:
+    //     moves = prompt_seekr(p);
+    //     goto curfwd;
+    // end:
+    //     moves = prompt_end(p);
+    // curfwd:
+    //     if (-1 == moves)
+    //         goto out;
+    //     if (moves > 0)
+    //         printf(VT_CURFWD_N, moves);
+    //     continue;
+    
+    // up:
+    //     moves = prompt_up(p, &buf);
+    //     goto set_line;
+    // down:
+    //     moves = prompt_down(p, &buf);
+    // set_line:
+    //     if (moves > 0 && buf)
+    //         printf(VT_CURBCK_N VT_CUREOL "%s", moves, buf);
+    //     else if (moves > 0)
+    //         printf(VT_CURBCK_N VT_CUREOL, moves);
+    //     else if (buf)
+    //         printf(VT_CUREOL "%s", buf);
+    //     continue;
+    
+    // redraw_line:
+    //     if (buf) {
+    //         draw_ps1 = (prompt_is_search(p) ? "" : ps1);
+    //         if (!moves)
+    //             printf(VT_CURSTR VT_CURSET_C "%s%s" VT_CUREOL VT_CURLDR, 1, draw_ps1, buf);
+    //         else if (moves > 0)
+    //             printf(VT_CURSTR VT_CURSET_C "%s%s" VT_CUREOL VT_CURLDR VT_CURFWD_N, 1, draw_ps1, buf, moves);
+    //         else
+    //             printf(VT_CURSTR VT_CURSET_C "%s%s" VT_CUREOL VT_CURLDR VT_CURBCK_N, 1, draw_ps1, buf, -moves);
+    //     }
+    //     else if (moves) {
+    //         if (moves > 0)
+    //             printf(VT_CURFWD_N, moves);
+    //         else
+    //             printf(VT_CURBCK_N, -moves);
+    //     }
+    //     continue;
 
 out:
     if (set_act)
