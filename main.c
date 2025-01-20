@@ -1,12 +1,15 @@
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
+#include <limits.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <signal.h>
 #include <string.h>
 #include <locale.h>
 #include <termios.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
 
@@ -74,6 +77,64 @@ static ssize_t utf8_strnlen(const char *c, size_t n) {
 
 static ssize_t utf8_strlen(const char *c) {
     return utf8_strnlen(c, (size_t)-1);
+}
+
+/////////////
+// Helper functions
+/////////////
+
+/**
+ * resolves the full path of a command from the path environment variable.
+ * special: the command must be executable by the user.
+ * returns the full path on success, or null if the command is not found.
+ *         the caller is responsible for freeing the returned memory.
+ */
+char *resolve_command_path(const char *command) {
+    char *path = getenv("PATH");
+    if (!path) 
+        return NULL;
+
+    struct stat sb;
+    const char *start = path;
+    const char *end;
+
+    while (start && *start) {
+        // find the next ':' or end of the string
+        end = strchr(start, ':');
+        if (!end) 
+            end = start + strlen(start);
+
+        // build the directory path
+        size_t dir_len = end - start;
+        if (dir_len > 0 && dir_len < PATH_MAX - 1) {
+            char dir[PATH_MAX];
+            strncpy(dir, start, dir_len);
+            dir[dir_len] = '\0';
+
+            // calculate the required size for full_path
+            size_t full_path_len = dir_len + strlen(command) + 2; // 1 for '/' and 1 for '\0'
+            char *full_path = malloc(full_path_len);
+            if (!full_path) 
+                return NULL;
+
+            // combine directory and command
+            snprintf(full_path, full_path_len, "%s/%s", dir, command);
+
+            // check if the file exists and is executable
+            // NOTE: if PATH=/a:/b and command=c and /a/c is NOT executable but /b/c is,
+            //       we will choose /a/c and fail
+            if (stat(full_path, &sb) == 0) {
+                return full_path;
+            }
+
+            free(full_path); // free if not found
+        }
+
+        // move to the next directory
+        start = (*end == ':') ? end + 1 : NULL;
+    }
+
+    return NULL;
 }
 
 /////////////
@@ -1129,11 +1190,320 @@ out:
     return ret;
 }
 
-static int interactive() {
+///////
+// Lex
+///////
+
+const char *IFS = " \t\n";
+
+struct lex {
+    const char *shname;
+};
+
+struct lex_proc {
+    char **argv;
+};
+
+void free_lex_proc(struct lex_proc *p) {
+    if (p->argv) {
+        for (char **arg = p->argv; *arg; arg++)
+            free(*arg);
+        free(p->argv);
+    }
+
+    free(p);
+}
+
+#define LEX_ERR(Lex, Fmt, ...) printf("%s: " Fmt, (Lex)->shname, ##__VA_ARGS__)
+
+int lex_parse_token(struct lex *lex, const char *input, char **out, const char **endp)
+{
+    int ret = -1;
+    int done_ifs = 0;
+    const char *curr;
+
+    char  *tok = NULL;
+    size_t n_tok = 0;
+
+    for (curr = input; *curr; curr++) {
+        // IFS: skip if not parsed any non-IFS, break after parsing IFS
+        if (strchr(IFS, *curr)) {
+            if (!done_ifs)
+                continue;
+            break;
+        }
+
+        done_ifs = 1;
+
+        if (!(tok = realloc(tok, n_tok + 1)))
+            goto out;
+        tok[n_tok] = *curr;
+        n_tok++;
+    }
+
+    if (endp)
+        *endp = curr;
+    if (out)
+        *out = tok;
+    ret = 0;
+out:
+    if (ret) {
+        if (tok)
+            free(tok);
+    }
+    return ret;
+}
+
+int lex_parse_proc(struct lex *lex, const char *input, struct lex_proc **outp, const char **endp)
+{
+    int ret = -1;
+    size_t nargv = 0;
+    struct lex_proc *p = NULL;
+
+    if (!(p = calloc(1, sizeof(*p))))
+        goto out;
+
+    if (!(p->argv = calloc(nargv, sizeof(char *))))
+        goto out;
+    nargv = 1;
+
+    while (*input) {
+        char *tok;
+        if (0 != lex_parse_token(lex, input, &tok, &input))
+            goto out;
+        
+        if (!(p->argv = realloc(p->argv, (nargv + 1) * sizeof(char *))))
+            goto out;
+        
+        p->argv[nargv - 1] = tok;
+        p->argv[nargv] = NULL;
+        nargv++;
+    }
+
+    if (endp)
+        *endp = input;
+    *outp = p;
+    ret = 0;
+out:
+    if (ret)
+        free_lex_proc(p);
+    return ret;
+}
+
+/////////////
+// Interpreter
+/////////////
+
+/**
+ * TODO:
+ * . simple commands
+ * . pipelines
+ * . lists
+ * .. && ||
+ * .. ; <newline>
+ * . compound commands
+ * .. (list)
+ * .. { list; }
+ * .. ((expression))
+ * .. [[ expression ]]
+ * . quotes
+ * . parameters
+ * . special parameters
+ * . arrays
+ * . expansion
+ * .. brace
+ * .. tilde
+ * .. parameter
+ * .. command substitution
+ * .. arithmetic
+ * .. word splitting
+ * .. pathname
+ * .. pattern matching
+ * . aliases
+ * . functions
+ * 
+ */
+
+struct rmsh {
+    const char *shname;
+    int last_exit_status;
+};
+
+#define RMSH_STRERR(Sh, Errno) fprintf(stderr, "%s: %s\n", (Sh)->shname, strerror(Errno))
+#define RMSH_SYSERR(Sh) RMSH_STRERR((Sh), errno)
+
+#define RMSH_ERRMSG(Sh, Msg) fprintf(stderr, "%s: %s\n", (Sh)->shname, (Msg))
+#define RMSH_STRERRMSG(Sh, Errno, Msg) fprintf(stderr, "%s: %s: %s\n", (Sh)->shname, (Msg), strerror(Errno))
+#define RMSH_SYSERRMSG(Sh, Msg) RMSH_STRERRMSG((Sh), errno, (Msg))
+
+#define RMSH_ERRFMT(Sh, Fmt, ...) fprintf(stderr, "%s: " Fmt "\n", (Sh)->shname, ##__VA_ARGS__)
+#define RMSH_STRERRFMT(Sh, Errno, Fmt, ...) fprintf(stderr, "%s: " Fmt ": %s\n", (Sh)->shname, ##__VA_ARGS__, strerror(Errno))
+#define RMSH_SYSERRFMT(Sh, Fmt, ...) RMSH_STRERRFMT((Sh), errno, Fmt, ##__VA_ARGS__)
+
+int rmsh_open(const char *shname, struct rmsh *out_sh)
+{
+    memset(out_sh, 0, sizeof(*out_sh));
+    out_sh->shname = shname;
+    out_sh->last_exit_status = 0;
+    return 0;
+}
+
+void rmsh_close(struct rmsh *sh)
+{
+
+}
+
+struct rmsh_proc {
+    struct rmsh_proc *next;
+    struct lex_proc *lex;
+    char *filename;
+    pid_t pid;
+};
+
+void free_rmsh_proc(struct rmsh_proc *p) {
+    if (p->filename)
+        free(p->filename);
+    if (p->lex)
+        free_lex_proc(p->lex);
+    free(p);
+}
+
+/**
+ * may return success and `out_filepath` NULL if not found in path
+ */
+int rmsh_resolve_program(struct rmsh *sh, const char *filename, char **out_filepath)
+{
+    int ret = -1;
+    char *filepath;
+
+    // if seperator in name, just use that file
+    if (strchr(filename, '/')) {
+        if (!(filepath = strdup(filename))) {
+            RMSH_STRERR(sh, ENOMEM);
+            goto out;
+        }
+
+        *out_filepath = filepath;
+        ret = 0;
+        goto out;
+    }
+
+    struct stat st;
+    char *path = getenv("PATH");
+    if (!path)
+        goto out;
+
+    ret = 0;
+out:
+    return ret;
+}
+
+/**
+ * returns pid or -1 on error;
+ */
+pid_t rmsh_exec(const char *shname, const char *filename, char **argv)
+{
+    pid_t ret = -1;
+    pid_t pid;
+
+    if (-1 == (pid = fork())) {
+        fprintf(stderr, "%s: %s\n", shname, strerror(errno));
+        goto out;
+    }
+
+    if (0 == pid) {
+        execv(filename, argv);
+        fprintf(stderr, "%s: %s: %s\n", shname, filename, strerror(errno));
+        exit(1);
+    }
+
+    ret = pid;
+out:
+    return ret;
+}
+
+/**
+ * consumes ownership of `lexp` even on failure
+ */
+int rmsh_launch_proc(struct rmsh *sh, struct lex_proc *lexp, struct rmsh_proc **out_shp)
+{
+    int ret = -1;
+    struct rmsh_proc *p = NULL;
+
+    if (!(p = calloc(1, sizeof(*p)))) {
+        RMSH_STRERR(sh, ENOMEM);
+        goto out;
+    }
+
+    p->lex = lexp;
+
+    if (strchr(lexp->argv[0], '/')) {
+        if (!(p->filename = strdup(lexp->argv[0]))) {
+            RMSH_STRERR(sh, ENOMEM);
+            goto out;
+        }
+    }
+    else if ((p->filename = resolve_command_path(lexp->argv[0]))) {
+    }
+    else {
+        RMSH_ERRFMT(sh, "%s: Command not found", lexp->argv[0]);
+        *out_shp = NULL;
+        free_rmsh_proc(p);
+        ret = 0;
+        goto out;
+    }
+
+    if (-1 == (p->pid = rmsh_exec(sh->shname, p->filename, p->lex->argv)))
+        goto out;
+    
+    *out_shp = p;
+    ret = 0;
+out:
+    if (ret)
+        free_rmsh_proc(p);
+    return ret;
+}
+
+int rmsh_input(struct rmsh *sh, const char *input)
+{
+    int ret = -1;
+    int status;
+    struct lex lex = {.shname = sh->shname};
+    struct lex_proc *lexp = NULL;
+    struct rmsh_proc *shp = NULL;
+
+    if (0 != lex_parse_proc(&lex, input, &lexp, &input))
+        goto out;
+
+    if (0 != rmsh_launch_proc(sh, lexp, &shp))
+        goto out;
+    
+    // command not found
+    if (!shp) {
+        ret = 0;
+        goto out;
+    }
+
+    if (shp->pid != waitpid(shp->pid, &status, 0)) {
+        RMSH_SYSERR(sh);
+        goto out;
+    }
+
+    ret = 0;
+out:
+    return ret;
+}
+
+/////////////
+// Main
+/////////////
+
+int interactive(const char *shname) {
     int ret = 1;
     struct termios termios;
     pid_t shpgid;
     struct prompt prmt = {0};
+    struct rmsh sh = {0};
 
     shpgid = getpgrp();
     ASSERT_PERROR(shpgid > 0, "getpgrp");
@@ -1155,6 +1525,9 @@ static int interactive() {
     // debug_prompt(&termios);
     // goto out;
     
+    if (0 != rmsh_open(shname, &sh))
+        goto out;
+
     while (1) {
         const char *in = prompt(&prmt, &termios);
         if (!in)
@@ -1169,19 +1542,100 @@ static int interactive() {
         if (0 != history_add(in))
             goto out;
         
-        printf("%s (%lu:%lu)\n", in, prmt.prmt_cur_col, strlen(in));
+        if (0 != rmsh_input(&sh, in))
+            goto out;
     }
 
     ret = 0;
 out:
+
+    rmsh_close(&sh);
+
     return ret;
+}
+
+int noninteractive(const char *shname, const char *command) {
+    int ret = 1;
+    struct rmsh sh = {0};
+
+    if (0 != rmsh_open(shname, &sh))
+        goto out;
+
+    if (0 != rmsh_input(&sh, command))
+            goto out;
+
+    ret = 0;
+out:
+
+    rmsh_close(&sh);
+
+    return ret;
+}
+
+void helpexit(const char *exe)
+{
+    printf("USAGE: %s [OPTION]...\n", exe);
+    printf("rmsh shell\n\n");
+    printf("  -c COMMAND     run a single command and exit\n");
+    printf("  -h             display this help and exit\n");
+    exit(0);
 }
 
 int main(int argc, char **argv)
 {
+    const char *bname = strrchr(argv[0], '/');
+    bname = (bname ? (bname + 1) : argv[0]);
+
+    const char *command = NULL;
+
+    int c;
+    do {
+        c = getopt(argc, argv, "hc:");\
+
+        if (c == 'h') {
+            helpexit(bname);
+        }
+        else if (c == 'c') {
+            command = optarg;
+        }
+        else {
+            if (c == -1) {
+                if (!argv[optind])
+                    break;
+                fprintf(stderr, "%s: invalid argument '%s'\n", bname, argv[optind]);
+            }
+            fprintf(stderr, "Try '%s -h' for more information.\n", bname);
+            exit(1);
+        }
+    } while (c >= 0);
+
+    if (command)
+        return noninteractive(bname, command);
+
     if (isatty(STDIN_FILENO))
-        return interactive();
+        return interactive(bname);
     
-    fprintf(stderr, "interactive only\n");
-    return 1;
+    char *cmdbuf = NULL;
+    size_t cmdn = 0;
+    while (1) {
+        char chunk[4096] = {0};
+        ssize_t currn = read(STDIN_FILENO, chunk, sizeof(chunk));
+        if (currn < 0) {
+            perror(bname);
+            free(cmdbuf);
+            return 1;
+        }
+        if (!currn)
+            break;
+        if (!(cmdbuf = realloc(cmdbuf, cmdn + currn))) {
+            errno = ENOMEM;
+            perror(bname);
+            return 1;
+        }
+        memcpy(cmdbuf + cmdn, chunk, currn);
+    }
+
+    int ret = noninteractive(bname, cmdbuf);
+    free(cmdbuf);
+    return ret;
 }
