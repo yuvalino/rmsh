@@ -176,6 +176,8 @@ const char *history_get(size_t idx) {
 #define CTRL_B 0x02
 #define CTRL_C 0x03
 #define CTRL_D 0x04
+#define CTRL_E 0x05
+#define CTRL_F 0x06
 #define CTRL_L 0x0c
 #define CTRL_R 0x12
 #define BACKSPACE 0x7f
@@ -384,12 +386,28 @@ int __termchar_input(struct __termchar *termchar, int c)
             termchar->tch_ctrl.private.count = 0;
             return 0; // read more data
         }
+        if (c == CTRL_A) {
+            TCHSET_CTRL(termchar, TCHCTRL_HOME);
+            return 1;
+        }
+        if (c == CTRL_B) {
+            TCHSET_CTRL(termchar, TCHCTRL_BCKWARD);
+            return 1;
+        }
         if (c == CTRL_C) {
             TCHSET_CTRL(termchar, TCHCTRL_LINEKILL);
             return 1;
         }
         if (c == CTRL_D) {
             TCHSET_CTRL(termchar, TCHCTRL_EXIT);
+            return 1;
+        }
+        if (c == CTRL_E) {
+            TCHSET_CTRL(termchar, TCHCTRL_END);
+            return 1;
+        }
+        if (c == CTRL_F) {
+            TCHSET_CTRL(termchar, TCHCTRL_FORWARD);
             return 1;
         }
         if (c == CTRL_R) {
@@ -1205,6 +1223,7 @@ struct lex_proc {
 };
 
 void free_lex_proc(struct lex_proc *p) {
+
     if (p->argv) {
         for (char **arg = p->argv; *arg; arg++)
             free(*arg);
@@ -1257,21 +1276,21 @@ out:
 int lex_parse_proc(struct lex *lex, const char *input, struct lex_proc **outp, const char **endp)
 {
     int ret = -1;
-    size_t nargv = 0;
+    size_t nargv;
     struct lex_proc *p = NULL;
 
     if (!(p = calloc(1, sizeof(*p))))
         goto out;
-
+    
+    nargv = 1;
     if (!(p->argv = calloc(nargv, sizeof(char *))))
         goto out;
-    nargv = 1;
 
     while (*input) {
         char *tok;
         if (0 != lex_parse_token(lex, input, &tok, &input))
             goto out;
-        
+
         if (!(p->argv = realloc(p->argv, (nargv + 1) * sizeof(char *))))
             goto out;
         
@@ -1498,7 +1517,7 @@ out:
 // Main
 /////////////
 
-int interactive(const char *shname) {
+int interactive(const char *shname, int debug_input) {
     int ret = 1;
     struct termios termios;
     pid_t shpgid;
@@ -1518,12 +1537,14 @@ int interactive(const char *shname) {
     }
 
     // take control of the terminal and get attributes
-    ASSERT_PERROR(setpgid(0, 0) == 0, "setpgid(0,0)");
+    setpgid(0, 0); // no checks, if we're session leader, it'll fail with EPERM
     ASSERT_PERROR(tcsetpgrp(STDIN_FILENO, shpgid) == 0, "tcsetpgrp");
     ASSERT_PERROR(tcgetattr(STDIN_FILENO, &termios) == 0, "tcgetattr");
 
-    // debug_prompt(&termios);
-    // goto out;
+    if (debug_input) {
+        debug_prompt(&termios);
+        goto out;
+    }
     
     if (0 != rmsh_open(shname, &sh))
         goto out;
@@ -1577,12 +1598,18 @@ void helpexit(const char *exe)
     printf("USAGE: %s [OPTION]...\n", exe);
     printf("rmsh shell\n\n");
     printf("  -c COMMAND     run a single command and exit\n");
+    printf("  -D             run debug input mode\n");
     printf("  -h             display this help and exit\n");
     exit(0);
 }
 
+#ifdef LIBRMSH
+int rmsh_main(int argc, char **argv)
+#else
 int main(int argc, char **argv)
+#endif
 {
+    int debug_input = 0;
     const char *bname = strrchr(argv[0], '/');
     bname = (bname ? (bname + 1) : argv[0]);
 
@@ -1590,13 +1617,16 @@ int main(int argc, char **argv)
 
     int c;
     do {
-        c = getopt(argc, argv, "hc:");\
+        c = getopt(argc, argv, "hc:D");\
 
         if (c == 'h') {
             helpexit(bname);
         }
         else if (c == 'c') {
             command = optarg;
+        }
+        else if (c == 'D') {
+            debug_input = 1;
         }
         else {
             if (c == -1) {
@@ -1613,7 +1643,7 @@ int main(int argc, char **argv)
         return noninteractive(bname, command);
 
     if (isatty(STDIN_FILENO))
-        return interactive(bname);
+        return interactive(bname, debug_input);
     
     char *cmdbuf = NULL;
     size_t cmdn = 0;
