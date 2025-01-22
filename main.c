@@ -89,7 +89,7 @@ static ssize_t utf8_strlen(const char *c) {
  * returns the full path on success, or null if the command is not found.
  *         the caller is responsible for freeing the returned memory.
  */
-char *resolve_command_path(const char *command) {
+static char *resolve_command_path(const char *command) {
     char *path = getenv("PATH");
     if (!path) 
         return NULL;
@@ -145,7 +145,7 @@ char *resolve_command_path(const char *command) {
 static char *history_buf[HIST_MAX] = {0};
 static size_t history_cur = 0;
 
-int history_add(const char *line) {
+static int history_add(const char *line) {
     if (history_buf[history_cur])
         free(history_buf[history_cur]);
     const char *result = history_buf[history_cur++] = strdup(line);
@@ -154,7 +154,7 @@ int history_add(const char *line) {
     return !result;
 }
 
-const char *history_get(size_t idx) {
+static const char *history_get(size_t idx) {
     if (idx >= HIST_MAX)
         return NULL;
     if (idx + 1 <= history_cur)
@@ -213,7 +213,7 @@ struct prompt {
     size_t  prmt_srch_query_sz;
 };
 
-void __prompt_reset(struct prompt *p, const char *ps1) {
+static void __prompt_reset(struct prompt *p, const char *ps1) {
     for (int i = 0; i < (HIST_MAX+1); i++)
         if (p->prmt_line[i])
             free(p->prmt_line[i]);
@@ -223,13 +223,13 @@ void __prompt_reset(struct prompt *p, const char *ps1) {
     p->prmt_ps1 = ps1;
 }
 
-const char *__prompt_get(struct prompt *p, size_t idx) {
+static const char *__prompt_get(struct prompt *p, size_t idx) {
     if (idx >= (1+HIST_MAX))
         return NULL;
     return p->prmt_line[idx] ?: (idx ? history_get(idx - 1) : NULL);
 }
 
-const char *prompt_get(struct prompt *p) {
+static const char *prompt_get(struct prompt *p) {
     return __prompt_get(p, p->prmt_cur_row);
 }
 
@@ -238,7 +238,7 @@ const char *prompt_get(struct prompt *p) {
  * returns -1 on error
  * NOTE: this modifies the internal state of `p`, including cursor position
  */
-int __prompt_search(struct prompt *p, size_t start_idx, const void *needle, size_t needle_len, int *out_moves) {
+static int __prompt_search(struct prompt *p, size_t start_idx, const void *needle, size_t needle_len, int *out_moves) {
     const char *s, *f;
     size_t n;
 
@@ -285,7 +285,7 @@ int __prompt_search(struct prompt *p, size_t start_idx, const void *needle, size
     return 0;
 }
 
-int prompt_is_search(struct prompt *p) {
+static int prompt_is_search(struct prompt *p) {
     return !!(p->prmt_srch_line);
 }
 
@@ -378,7 +378,7 @@ struct __termchar {
 /**
  * returns: 1 on success, 0 if needs to read more or -1 on failure
  */
-int __termchar_input(struct __termchar *termchar, int c)
+static int __termchar_input(struct __termchar *termchar, int c)
 {
     if (termchar->tch_type == TCHTYPE_UNK) {
         if (c == '\e') {
@@ -571,7 +571,7 @@ int __termchar_input(struct __termchar *termchar, int c)
     return -1; // invalid character between '\e[' and '~'
 }
 
-void __print_movecursor(int moves)
+static void __print_movecursor(int moves)
 {
     if (moves > 0)
         printf(VT_CURFWD_N, moves);
@@ -583,7 +583,7 @@ void __print_movecursor(int moves)
  * if `buf=NULL`, same as `__print_movecursor(moves);`
  * reprints the entire current line and moves the cursor afterwards
  */
-void __print_redrawline(const char *ps1, const char *buf, int moves)
+static void __print_redrawline(const char *ps1, const char *buf, int moves)
 {
     if (!buf) {
         __print_movecursor(moves);
@@ -601,7 +601,7 @@ void __print_redrawline(const char *ps1, const char *buf, int moves)
 /**
  * reprints line and sets cursor to end of line.
  */
-void __print_redrawline_eol(const char *ps1, const char *buf)
+static void __print_redrawline_eol(const char *ps1, const char *buf)
 {
     printf(VT_CURSET_C "%s%s" VT_CURSTR VT_CUREOL VT_CURLDR, 1, (ps1 ?: ""), (buf ?: ""));
 }
@@ -612,7 +612,7 @@ void __print_redrawline_eol(const char *ps1, const char *buf)
  * if moves is positive, moves cursor AFTER redrawing.
  * if moves is negative, moves cursor BEFORE redrawing.
  */
-void __print_redrawcursor(const char *buf, int moves_before, int moves_after)
+static void __print_redrawcursor(const char *buf, int moves_before, int moves_after)
 {
     if (!buf) {
         __print_movecursor(moves_before + moves_after);
@@ -639,7 +639,7 @@ void __print_redrawcursor(const char *buf, int moves_before, int moves_after)
  * returns 0 on success and non-zero on failure.
  * NOTE: prints to screen.
  */
-int __prompt_output_search(struct prompt *p, const char *s, size_t n)
+static int __prompt_output_search(struct prompt *p, const char *s, size_t n)
 {
     int moves = utf8_strnlen(s, n);
     if (moves == -1)
@@ -682,7 +682,7 @@ int __prompt_output_search(struct prompt *p, const char *s, size_t n)
  * returns 0 on success and non-zero on failure
  * NOTE: prints to screen.
  */
-int __prompt_output_line(struct prompt *p, const char *s, size_t n)
+static int __prompt_output_line(struct prompt *p, const char *s, size_t n)
 {
     int moves = utf8_strnlen(s, n);
     if (moves == -1)
@@ -722,7 +722,7 @@ int __prompt_output_line(struct prompt *p, const char *s, size_t n)
  * returns 0 on success and non-zero on failure
  * NOTE: prints to screen.
  */
-int __prompt_output_enter_search(struct prompt *p)
+static int __prompt_output_enter_search(struct prompt *p)
 {
     if (p->prmt_srch_line)
         return 0; // already in search, ignore
@@ -753,7 +753,7 @@ int __prompt_output_enter_search(struct prompt *p)
  * returns 0 on success and non-zero on failure
  * NOTE: prints to screen.
  */
-int __prompt_output_next_search(struct prompt *p)
+static int __prompt_output_next_search(struct prompt *p)
 {
     if (!p->prmt_srch_line)
         return -1; // not in search mode
@@ -778,7 +778,7 @@ int __prompt_output_next_search(struct prompt *p)
  * Else, amount of cursor moves is returned via `out_moves`.
  * NOTE: prints to screen.if `out_moves` is NULL.
  */
-int __prompt_output_exit_search(struct prompt *p, int *out_moves)
+static int __prompt_output_exit_search(struct prompt *p, int *out_moves)
 {
     if (!p->prmt_srch_line)
         return 0; // not in search, ignore
@@ -811,7 +811,7 @@ int __prompt_output_exit_search(struct prompt *p, int *out_moves)
  * returns 0 on success and non-zero on failure
  * NOTE: prints to screen.
  */
-int __prompt_output_backspace_search(struct prompt *p)
+static int __prompt_output_backspace_search(struct prompt *p)
 {
     if (!p->prmt_srch_line)
         return -1; // not in search
@@ -837,7 +837,7 @@ int __prompt_output_backspace_search(struct prompt *p)
  * returns 0 on success and non-zero on failure
  * NOTE: prints to screen.
  */
-int __prompt_output_backspace_line(struct prompt *p)
+static int __prompt_output_backspace_line(struct prompt *p)
 {
     if (!p->prmt_cur_col)
         return 0; // nothing to delete
@@ -869,7 +869,7 @@ int __prompt_output_backspace_line(struct prompt *p)
  * returns 0 on success and non-zero on failure
  * NOTE: prints to screen if `out_moves` is NULL
  */
-int __prompt_output_del(struct prompt *p, int *out_moves)
+static int __prompt_output_del(struct prompt *p, int *out_moves)
 {
     const char *curr_line_const = prompt_get(p);
     size_t n = (curr_line_const ? strlen(curr_line_const) : 0);
@@ -904,7 +904,7 @@ int __prompt_output_del(struct prompt *p, int *out_moves)
  * returns 0 on success and non-zero on failure
  * NOTE: prints to screen if `out_moves` is NULL.
  */
-int __prompt_output_cursor_backward(struct prompt *p, int *out_moves)
+static int __prompt_output_cursor_backward(struct prompt *p, int *out_moves)
 {
     if (!p->prmt_cur_col)
         return 0; // nothing to delete
@@ -930,7 +930,7 @@ int __prompt_output_cursor_backward(struct prompt *p, int *out_moves)
  * returns 0 on success and non-zero on failure
  * NOTE: prints to screen if `out_moves` is NULL.
  */
-int __prompt_output_cursor_forward(struct prompt *p, int *out_moves)
+static int __prompt_output_cursor_forward(struct prompt *p, int *out_moves)
 {
     const char *curr_line = prompt_get(p);
     size_t curr_line_sz = (curr_line ? strlen(curr_line) : 0);
@@ -958,7 +958,7 @@ int __prompt_output_cursor_forward(struct prompt *p, int *out_moves)
  * returns 0 on success and non-zero on failure
  * NOTE: prints to screen if `out_moves` is NULL.
  */
-int __prompt_output_cursor_home(struct prompt *p, int *out_moves)
+static int __prompt_output_cursor_home(struct prompt *p, int *out_moves)
 {
     int ret;
     int moves = 0;
@@ -978,7 +978,7 @@ int __prompt_output_cursor_home(struct prompt *p, int *out_moves)
  * returns 0 on success and non-zero on failure
  * NOTE: prints to screen if `out_moves` is NULL.
  */
-int __prompt_output_cursor_end(struct prompt *p, int *out_moves)
+static int __prompt_output_cursor_end(struct prompt *p, int *out_moves)
 {
     int ret;
     int moves = 0;
@@ -999,7 +999,7 @@ int __prompt_output_cursor_end(struct prompt *p, int *out_moves)
  * returns 0 on success and non-zero on failure
  * NOTE: prints to screen.
  */
-int __prompt_output_history_up(struct prompt *p)
+static int __prompt_output_history_up(struct prompt *p)
 {
     int ignored;
     int ret;
@@ -1025,7 +1025,7 @@ int __prompt_output_history_up(struct prompt *p)
  * returns 0 on success and non-zero on failure
  * NOTE: prints to screen.
  */
-int __prompt_output_history_down(struct prompt *p)
+static int __prompt_output_history_down(struct prompt *p)
 {
     int ignored;
     int ret;
@@ -1048,7 +1048,7 @@ int __prompt_output_history_down(struct prompt *p)
  * returns 0 on success and non-zero on failure
  * NOTE: prints to screen.
  */
-int __prompt_output_clear(struct prompt *p)
+static int __prompt_output_clear(struct prompt *p)
 {
     int moves = 0;
     int ret;
@@ -1066,7 +1066,7 @@ int __prompt_output_clear(struct prompt *p)
     return 0;
 }
 
-const char *__prompt_output(struct prompt *p, struct __termchar *input)
+static const char *__prompt_output(struct prompt *p, struct __termchar *input)
 {
     int ret;
     if (input->tch_type == TCHTYPE_TEXT) {
@@ -1080,6 +1080,7 @@ const char *__prompt_output(struct prompt *p, struct __termchar *input)
     // input->tch_type == TCHTYPE_CTRL
 
     if (input->tch_ctrl.value == TCHCTRL_EXIT) {
+        ECHO_CNTRL(CTRL_D);
         putchar('\n');
         return PRMT_EXIT;
     }
@@ -1143,7 +1144,7 @@ const char *__prompt_output(struct prompt *p, struct __termchar *input)
     return NULL;
 }
 
-const char *prompt(struct prompt *p, struct termios *termios_p)
+static const char *prompt(struct prompt *p, struct termios *termios_p)
 {
     const char *ret = PRMT_ABRT;
     struct termios raw_termios;
@@ -1212,7 +1213,7 @@ out:
 // Lex
 ///////
 
-const char *IFS = " \t\n";
+static const char *IFS = " \t\n";
 
 struct lex {
     const char *shname;
@@ -1222,7 +1223,7 @@ struct lex_proc {
     char **argv;
 };
 
-void free_lex_proc(struct lex_proc *p) {
+static void free_lex_proc(struct lex_proc *p) {
 
     if (p->argv) {
         for (char **arg = p->argv; *arg; arg++)
@@ -1235,7 +1236,7 @@ void free_lex_proc(struct lex_proc *p) {
 
 #define LEX_ERR(Lex, Fmt, ...) printf("%s: " Fmt, (Lex)->shname, ##__VA_ARGS__)
 
-int lex_parse_token(struct lex *lex, const char *input, char **out, const char **endp)
+static int lex_parse_token(struct lex *lex, const char *input, char **out, const char **endp)
 {
     int ret = -1;
     int done_ifs = 0;
@@ -1273,7 +1274,7 @@ out:
     return ret;
 }
 
-int lex_parse_proc(struct lex *lex, const char *input, struct lex_proc **outp, const char **endp)
+static int lex_parse_proc(struct lex *lex, const char *input, struct lex_proc **outp, const char **endp)
 {
     int ret = -1;
     size_t nargv;
@@ -1359,7 +1360,7 @@ struct rmsh {
 #define RMSH_STRERRFMT(Sh, Errno, Fmt, ...) fprintf(stderr, "%s: " Fmt ": %s\n", (Sh)->shname, ##__VA_ARGS__, strerror(Errno))
 #define RMSH_SYSERRFMT(Sh, Fmt, ...) RMSH_STRERRFMT((Sh), errno, Fmt, ##__VA_ARGS__)
 
-int rmsh_open(const char *shname, struct rmsh *out_sh)
+static int rmsh_open(const char *shname, struct rmsh *out_sh)
 {
     memset(out_sh, 0, sizeof(*out_sh));
     out_sh->shname = shname;
@@ -1367,7 +1368,7 @@ int rmsh_open(const char *shname, struct rmsh *out_sh)
     return 0;
 }
 
-void rmsh_close(struct rmsh *sh)
+static void rmsh_close(struct rmsh *sh)
 {
 
 }
@@ -1379,7 +1380,7 @@ struct rmsh_proc {
     pid_t pid;
 };
 
-void free_rmsh_proc(struct rmsh_proc *p) {
+static void free_rmsh_proc(struct rmsh_proc *p) {
     if (p->filename)
         free(p->filename);
     if (p->lex)
@@ -1390,7 +1391,7 @@ void free_rmsh_proc(struct rmsh_proc *p) {
 /**
  * may return success and `out_filepath` NULL if not found in path
  */
-int rmsh_resolve_program(struct rmsh *sh, const char *filename, char **out_filepath)
+static int rmsh_resolve_program(struct rmsh *sh, const char *filename, char **out_filepath)
 {
     int ret = -1;
     char *filepath;
@@ -1420,7 +1421,7 @@ out:
 /**
  * returns pid or -1 on error;
  */
-pid_t rmsh_exec(const char *shname, const char *filename, char **argv)
+static pid_t rmsh_exec(const char *shname, const char *filename, char **argv)
 {
     pid_t ret = -1;
     pid_t pid;
@@ -1444,7 +1445,7 @@ out:
 /**
  * consumes ownership of `lexp` even on failure
  */
-int rmsh_launch_proc(struct rmsh *sh, struct lex_proc *lexp, struct rmsh_proc **out_shp)
+static int rmsh_launch_proc(struct rmsh *sh, struct lex_proc *lexp, struct rmsh_proc **out_shp)
 {
     int ret = -1;
     struct rmsh_proc *p = NULL;
@@ -1483,7 +1484,7 @@ out:
     return ret;
 }
 
-int rmsh_input(struct rmsh *sh, const char *input)
+static int rmsh_input(struct rmsh *sh, const char *input)
 {
     int ret = -1;
     int status;
@@ -1517,7 +1518,7 @@ out:
 // Main
 /////////////
 
-int interactive(const char *shname, int debug_input) {
+static int interactive(const char *shname, int debug_input) {
     int ret = 1;
     struct termios termios;
     pid_t shpgid;
@@ -1575,7 +1576,7 @@ out:
     return ret;
 }
 
-int noninteractive(const char *shname, const char *command) {
+static int noninteractive(const char *shname, const char *command) {
     int ret = 1;
     struct rmsh sh = {0};
 
@@ -1593,7 +1594,7 @@ out:
     return ret;
 }
 
-void helpexit(const char *exe)
+static void helpexit(const char *exe)
 {
     printf("USAGE: %s [OPTION]...\n", exe);
     printf("rmsh shell\n\n");
