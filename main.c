@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <limits.h>
 #include <unistd.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <signal.h>
 #include <string.h>
@@ -135,6 +136,22 @@ static char *resolve_command_path(const char *command) {
     }
 
     return NULL;
+}
+
+/**
+ * failure function for when all else fails
+ */
+void panic(const char *err)
+{
+    if (err) {
+        write(STDERR_FILENO, "rmsh: panic: ", 13);
+        write(STDERR_FILENO, err, strlen(err));
+        write(STDERR_FILENO, "\n", 1);
+    }
+    else {
+        write(STDERR_FILENO, "rmsh: panic\n", 12);
+    }
+    _exit(1);
 }
 
 /////////////
@@ -1213,15 +1230,24 @@ out:
 // Lex
 ///////
 
+#define LEX_ENOMEM ((char *)-1)
+
 static const char *IFS = " \t\n";
 
 struct lex {
-    const char *shname;
+    unsigned line;
+    char *error;
+    int erralloc;
 };
 
 struct lex_proc {
     char **argv;
 };
+
+static void free_lex(struct lex *lex) {
+    if (lex->erralloc && lex->error)
+        free(lex->error);
+}
 
 static void free_lex_proc(struct lex_proc *p) {
 
@@ -1234,9 +1260,33 @@ static void free_lex_proc(struct lex_proc *p) {
     free(p);
 }
 
-#define LEX_ERR(Lex, Fmt, ...) printf("%s: " Fmt, (Lex)->shname, ##__VA_ARGS__)
+static void lex_set_error(struct lex *lex, const char *fmt, ...)
+{
+    if (lex->error) {
+        if (lex->erralloc)
+            free(lex->error);
+        lex->error = NULL;
+        lex->erralloc = 0;
+    }
 
-static int lex_parse_token(struct lex *lex, const char *input, char **out, const char **endp)
+    va_list ap;
+    va_start(ap, fmt);
+    if (-1 == vasprintf(&lex->error, fmt, ap)) {
+        lex->error = strerror(ENOMEM);
+        lex->erralloc = 0;
+    }
+    else {
+        lex->erralloc = 1;
+    }
+        
+    va_end(ap);
+}
+
+/**
+ * returns 0 with `*outp` allocated string of token on success.
+ * returns -1 on general error and sets lex->error
+ */
+static int lex_parse_token(struct lex *lex, const char *input, char **outp, const char **endp)
 {
     int ret = -1;
     int done_ifs = 0;
@@ -1245,8 +1295,14 @@ static int lex_parse_token(struct lex *lex, const char *input, char **out, const
     char  *tok = NULL;
     size_t n_tok = 0;
 
+    *outp = NULL;
+
     for (curr = input; *curr; curr++) {
-        // IFS: skip if not parsed any non-IFS, break after parsing IFS
+        // lines counter
+        if (*curr == '\n')
+            lex->line++;
+
+        // ifs: skip if not parsed any non-IFS, break after parsing IFS
         if (strchr(IFS, *curr)) {
             if (!done_ifs)
                 continue;
@@ -1255,45 +1311,93 @@ static int lex_parse_token(struct lex *lex, const char *input, char **out, const
 
         done_ifs = 1;
 
-        if (!(tok = realloc(tok, n_tok + 1)))
+        // handle quoted strings
+        if (*curr == '\'' || *curr == '"') {
+            char quote = *curr; // store the quote type
+            curr++;             // move past the opening quote
+            while (*curr && *curr != quote) {
+                if (!(tok = realloc(tok, n_tok + 1))) {
+                    lex_set_error(lex, strerror(ENOMEM));
+                    goto out;
+                }
+
+                // lines counter
+                if (*curr == '\n')
+                    lex->line++;
+                
+                tok[n_tok] = *curr;
+                n_tok++;
+                curr++;
+            }
+            if (*curr != quote) {
+                // unterminated quote, cleanup and return error
+                lex_set_error(lex, "unexpected EOF while looking for matching quote `%c%c", quote, (int)'"' + (int)'\'' - quote);
+                goto out;
+            }
+            continue; // skip adding the closing quote to the token
+        }
+
+        if (!(tok = realloc(tok, n_tok + 1))) {
+            lex_set_error(lex, strerror(ENOMEM));
             goto out;
+        }
         tok[n_tok] = *curr;
         n_tok++;
     }
 
+    // null-terminate the token
+    if (!(tok = realloc(tok, n_tok + 1))){
+        lex_set_error(lex, strerror(ENOMEM));
+        goto out;
+    }
+    tok[n_tok] = '\0';
+
     if (endp)
         *endp = curr;
-    if (out)
-        *out = tok;
+    if (outp)
+        *outp = tok;
     ret = 0;
+
 out:
-    if (ret) {
+    if (ret || !outp || !(*outp)) {
         if (tok)
             free(tok);
     }
     return ret;
 }
 
+/**
+ * returns 0 and sets `*outp` to allocated `lex_proc` struct.
+ * returns -1 on general error and sets `lex->error`.
+ */
 static int lex_parse_proc(struct lex *lex, const char *input, struct lex_proc **outp, const char **endp)
 {
     int ret = -1;
     size_t nargv;
     struct lex_proc *p = NULL;
 
-    if (!(p = calloc(1, sizeof(*p))))
+    *outp = NULL;
+
+    if (!(p = calloc(1, sizeof(*p)))) {
+        lex_set_error(lex, strerror(ENOMEM));
         goto out;
+    }
     
     nargv = 1;
-    if (!(p->argv = calloc(nargv, sizeof(char *))))
+    if (!(p->argv = calloc(nargv, sizeof(char *)))) {
+        lex_set_error(lex, strerror(ENOMEM));
         goto out;
+    }
 
     while (*input) {
         char *tok;
         if (0 != lex_parse_token(lex, input, &tok, &input))
             goto out;
 
-        if (!(p->argv = realloc(p->argv, (nargv + 1) * sizeof(char *))))
+        if (!(p->argv = realloc(p->argv, (nargv + 1) * sizeof(char *)))) {
+            lex_set_error(lex, strerror(ENOMEM));
             goto out;
+        }
         
         p->argv[nargv - 1] = tok;
         p->argv[nargv] = NULL;
@@ -1488,12 +1592,14 @@ static int rmsh_input(struct rmsh *sh, const char *input)
 {
     int ret = -1;
     int status;
-    struct lex lex = {.shname = sh->shname};
+    struct lex lex = {.line = 1};
     struct lex_proc *lexp = NULL;
     struct rmsh_proc *shp = NULL;
 
-    if (0 != lex_parse_proc(&lex, input, &lexp, &input))
+    if (0 != lex_parse_proc(&lex, input, &lexp, &input)) {
+        RMSH_ERRFMT(sh, "line %u: %s", lex.line, lex.error ? : strerror(0));
         goto out;
+    }
 
     if (0 != rmsh_launch_proc(sh, lexp, &shp))
         goto out;
@@ -1511,6 +1617,7 @@ static int rmsh_input(struct rmsh *sh, const char *input)
 
     ret = 0;
 out:
+    free_lex(&lex);
     return ret;
 }
 
@@ -1564,8 +1671,8 @@ static int interactive(const char *shname, int debug_input) {
         if (0 != history_add(in))
             goto out;
         
-        if (0 != rmsh_input(&sh, in))
-            goto out;
+        // we don't care, let use know and continue
+        (void)rmsh_input(&sh, in);
     }
 
     ret = 0;
