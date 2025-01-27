@@ -138,19 +138,27 @@ static char *resolve_command_path(const char *command) {
     return NULL;
 }
 
-/**
- * failure function for when all else fails
- */
-void panic(const char *err)
+void panic0()
 {
-    if (err) {
-        write(STDERR_FILENO, "rmsh: panic: ", 13);
-        write(STDERR_FILENO, err, strlen(err));
-        write(STDERR_FILENO, "\n", 1);
-    }
-    else {
-        write(STDERR_FILENO, "rmsh: panic\n", 12);
-    }
+    write(STDERR_FILENO, "rmsh: panic\n", 12);
+    _exit(1);
+}
+
+void panic1(const char *err)
+{
+    write(STDERR_FILENO, "rmsh: panic: ", 13);
+    write(STDERR_FILENO, err, strlen(err));
+    write(STDERR_FILENO, "\n", 1);
+    _exit(1);
+}
+
+void panic2(const char *err1, const char *err2)
+{
+    write(STDERR_FILENO, "rmsh: panic: ", 13);
+    write(STDERR_FILENO, err1, strlen(err1));
+    write(STDERR_FILENO, ": ", 2);
+    write(STDERR_FILENO, err2, strlen(err2));
+    write(STDERR_FILENO, "\n", 1);
     _exit(1);
 }
 
@@ -1246,9 +1254,6 @@ out:
 #define LEXF_META    0x1
 #define LEXF_PREMETA 0x2
 
-static const char *IFS = " \t\n";
-static const char *METACHARS = "|&;()<>";
-
 /**
  * wrapper for a parsed token
  */
@@ -1296,11 +1301,6 @@ struct lex {
     struct lex_tok *tok_head; // linked list of already parsed tokens
 };
 
-struct lex_proc {
-    int    argc;
-    char **argv;
-};
-
 static void lex_free(struct lex *lex) {
     while (lex->tok_head) {
         struct lex_tok *tmp = lex->tok_head;
@@ -1319,7 +1319,7 @@ static int lex_create(const char *input, unsigned line, struct lex **outp) {
     int ret = 1;
 
     if (!(*outp = calloc(1, sizeof(**outp))))
-        panic(strerror(ENOMEM));
+        panic1(strerror(ENOMEM));
 
     (*outp)->input = (*outp)->cursor = input;
     (*outp)->line = line;
@@ -1328,17 +1328,6 @@ static int lex_create(const char *input, unsigned line, struct lex **outp) {
 
 out:
     return ret;
-}
-
-static void free_lex_proc(struct lex_proc *p) {
-
-    if (p->argv) {
-        for (int i = 0; i < p->argc; i++)
-            free(p->argv[i]);
-        free(p->argv);
-    }
-
-    free(p);
 }
 
 static void lex_set_error(struct lex *lex, const char *fmt, ...)
@@ -1392,6 +1381,9 @@ static int lex_token_insert_cursor(struct lex *lex, struct lex_tok *tok)
     return 0;
 }
 
+static const char *IFS = " \t\n";
+static const char *METACHARS = "|&;()<>";
+
 /**
  * returns 0 with `*outp` allocated token on success.
  * if token is to be skipped, the string value (as returned from lex_tok_consume) is NULL.
@@ -1421,6 +1413,28 @@ static int lex_pop_token(struct lex *lex, struct lex_tok **outp)
     }
 
     for (; CURR; lex->cursor++) {
+
+        // parse meta characters together, split words
+        if (strchr(METACHARS, CURR)) {
+            // if a word is already constructing, break but mark it as PREMETA
+            if (!(tok->flags & LEXF_META) && tok->n) {
+                tok->flags |= LEXF_PREMETA;
+                break;
+            }
+            
+            // this is the first non-whitespace char, return it
+            if (0 != lex_token_insert(lex, tok, CURR))
+                goto out;
+            tok->flags |= LEXF_META; // mark as meta char (if not already marked)
+            continue;
+        }
+        
+        // not a meta-character
+
+        // if constructing a metacharactered word, make sure to cut it first
+        if (tok->flags & LEXF_META)
+            break;
+
         // lines counter
         if (CURR == '\n')
             lex->line++;
@@ -1433,20 +1447,6 @@ static int lex_pop_token(struct lex *lex, struct lex_tok **outp)
         }
 
         done_ifs = 1;
-
-        if (strchr(METACHARS, CURR)) {
-            // if a word is already constructing, break but mark it as PREMETA
-            if (tok->n) {
-                tok->flags |= LEXF_PREMETA;
-                break;
-            }
-            
-            // this is the first non-whitespace char, return it
-            if (0 != lex_token_insert_cursor(lex, tok))
-                goto out;
-            tok->flags |= LEXF_META; // mark as meta char
-            break;
-        }
 
         // handle quoted strings
         if (CURR == '\'' || CURR == '"') {
@@ -1500,10 +1500,61 @@ out:
 static void lex_push_token(struct lex *lex, struct lex_tok *tok)
 {
     if (tok->next)
-        panic("tok->next != NULL");
+        panic1("tok->next != NULL");
     
     tok->next = lex->tok_head;
     lex->tok_head = tok;
+}
+
+// Redirection type
+#define LEXRT_PATH_IN      0x01  // [n]<word
+#define LEXRT_PATH_OTRUNC  0x02  // [n]>word
+#define LEXRT_PATH_OAPPEND 0x04  // [n]>>word
+#define LEXRT_PATH_INOUT   0x08  // [n]<>word
+#define LEXRT_FD_IN        0x10  // [n]<&word
+#define LEXRT_FD_OUT       0x20  // [n]>&word
+
+#define LEXRT_PATH         (LEXRT_PATH_IN | LEXRT_PATH_OTRUNC | LEXRT_PATH_OAPPEND | LEXRT_PATH_INOUT)
+#define LEXRT_FD           (LEXRT_FD_IN   | LEXRT_FD_OUT)
+
+struct lex_redir {
+    struct lex_redir *next; // link to `lex_proc->redir_head`
+    
+    int redir_fd;  // target fd number to redirect
+
+    int type; // input / output / appendput
+
+    union {
+        char *s;
+        int   fd;
+    } source;
+};
+
+struct lex_proc {
+    int    argc;
+    char **argv;
+
+    struct lex_redir *redir_head;
+    struct lex_redir *redir_tail;
+};
+
+static void free_lex_proc(struct lex_proc *p) {
+
+    while (p->redir_head) {
+        struct lex_redir *tmp = p->redir_head;
+        p->redir_head = tmp->next;
+
+        free(tmp);
+    }
+    p->redir_tail = NULL;
+
+    if (p->argv) {
+        for (int i = 0; i < p->argc; i++)
+            free(p->argv[i]);
+        free(p->argv);
+    }
+
+    free(p);
 }
 
 /**
@@ -1515,6 +1566,7 @@ static int lex_pop_proc(struct lex *lex, struct lex_proc **outp)
     int ret = -1;
     struct lex_proc *p = NULL;
     struct lex_tok *tok = NULL;
+    struct lex_tok *premeta = NULL;
 
     if (!(p = calloc(1, sizeof(*p)))) {
         lex_set_error(lex, strerror(ENOMEM));
@@ -1524,6 +1576,124 @@ static int lex_pop_proc(struct lex *lex, struct lex_proc **outp)
     while (lex->tok_head || *lex->cursor) {
         if (0 != lex_pop_token(lex, &tok))
             goto out;
+
+        // handle meta characters
+        if (tok->flags & LEXF_META) {
+            if (!tok->n || !tok->s)
+                panic1("metachar tok empty");
+
+            // redirection
+            if (strchr("<>", tok->s[0])) {
+                // default redirect FDs
+                long parsed_fd = ((tok->s[0] == '>') ? STDOUT_FILENO : STDIN_FILENO);
+
+                // parse redirect fd from premeta token if available
+                if (premeta) {
+                    if (0 != atol_exact(premeta->s, 10, &parsed_fd) || parsed_fd < 0) {
+                        // if premeta token is invalid file descriptor, reparse it token as regular token
+                        lex_push_token(lex, tok);
+                        tok = NULL;
+                        lex_push_token(lex, premeta);
+                        premeta = NULL;
+                        continue;
+                    }
+
+                    lex_tok_free(premeta);
+                    premeta = NULL;
+                }
+
+                // allocate new redir into p->redir_tail
+                struct lex_redir *redir;
+                if (!(redir = calloc(1, sizeof(*redir)))) {
+                    lex_set_error(lex, strerror(ENOMEM));
+                    goto out;
+                }
+                redir->redir_fd = (int)parsed_fd;
+                if (!p->redir_head)
+                    p->redir_head = redir;
+                else
+                    p->redir_tail->next = redir;
+                p->redir_tail = redir;
+
+                // parse redirection type
+                if (strcmp(tok->s, "<") == 0)
+                    redir->type = LEXRT_PATH_IN;
+                else if (strcmp(tok->s, ">") == 0)
+                    redir->type = LEXRT_PATH_OTRUNC;
+                else if (strcmp(tok->s, ">>") == 0)
+                    redir->type = LEXRT_PATH_OAPPEND;
+                else if (strcmp(tok->s, "<>") == 0)
+                    redir->type = LEXRT_PATH_INOUT;
+                else if (strcmp(tok->s, "<&") == 0)
+                    redir->type = LEXRT_FD_IN;
+                else if (strcmp(tok->s, ">&") == 0)
+                    redir->type = LEXRT_FD_OUT;
+                else {
+                    lex_set_error(lex, "unknown redirection op `%s'", tok->s);
+                    goto out;
+                }
+
+                // get source redirection arg (free current tok)
+                lex_tok_free(tok);
+                tok = NULL;
+
+                if (0 != lex_pop_token(lex, &tok))
+                    goto out;
+                
+                if (!tok->s) {
+                    lex_set_error(lex, "syntax error near unexpected EOF");
+                    goto out;
+                }
+
+                if (tok->flags & LEXF_META) {
+                    lex_set_error(lex, "syntax error near unexpected token `%s'", tok->s);
+                    goto out;
+                }
+
+                if (redir->type & LEXRT_FD) {
+                    // parse as file descriptor
+                    if (0 != atol_exact(tok->s, 10, &parsed_fd) || parsed_fd < 0) {
+                        lex_set_error(lex, "invalid redirection fd `%s'", tok->s);
+                        goto out;
+                    }
+                    lex_tok_free(tok);
+                    tok = NULL;
+                }
+                else {
+                    // parse as raw string
+                    redir->source.s = lex_tok_consume(tok);
+                    tok = NULL;
+                }
+            }
+            else {
+                lex_set_error(lex, "metacharacter not supported `%s'", tok->s);
+                goto out;
+            }
+
+            if (premeta)
+                panic2("unattended premeta token", premeta->s);
+
+            // parse next token after metacharacter is parsed
+            continue;
+        }
+        
+        if (tok->flags & LEXF_PREMETA) {
+            if (premeta)
+                panic2("premeta tokens encountered twice, first", premeta->s);
+            
+            // save premeta token for parsing meta character
+            premeta = tok;
+            tok = NULL;
+
+            // turn off premeta flag
+            premeta->flags &= ~LEXF_PREMETA;
+            continue;
+        }
+        else if (premeta) {
+            lex_push_token(lex, tok);
+            tok = premeta;
+            premeta = NULL;
+        }
 
         char *arg = lex_tok_consume(tok);
         tok = NULL;
@@ -1550,6 +1720,8 @@ static int lex_pop_proc(struct lex *lex, struct lex_proc **outp)
     ret = 0;
     
 out:
+    if (premeta)
+        lex_tok_free(premeta);
     if (tok)
         lex_tok_free(tok);
     if (ret)
@@ -1622,46 +1794,13 @@ static void rmsh_close(struct rmsh *sh)
 struct rmsh_proc {
     struct rmsh_proc *next;
     struct lex_proc *lex;
-    char *filename;
     pid_t pid;
 };
 
 static void free_rmsh_proc(struct rmsh_proc *p) {
-    if (p->filename)
-        free(p->filename);
     if (p->lex)
         free_lex_proc(p->lex);
     free(p);
-}
-
-/**
- * may return success and `out_filepath` NULL if not found in path
- */
-static int rmsh_resolve_program(struct rmsh *sh, const char *filename, char **out_filepath)
-{
-    int ret = -1;
-    char *filepath;
-
-    // if seperator in name, just use that file
-    if (strchr(filename, '/')) {
-        if (!(filepath = strdup(filename))) {
-            RMSH_STRERR(sh, ENOMEM);
-            goto out;
-        }
-
-        *out_filepath = filepath;
-        ret = 0;
-        goto out;
-    }
-
-    struct stat st;
-    char *path = getenv("PATH");
-    if (!path)
-        goto out;
-
-    ret = 0;
-out:
-    return ret;
 }
 
 /**
@@ -1688,6 +1827,84 @@ out:
     return ret;
 }
 
+#define REDIR_MODE 0666
+
+/**
+ * child function
+ */
+static int rmsh_child(const char *shname, struct rmsh_proc *p)
+{
+    int tmpfd;
+    char *exe_path = NULL;
+
+    // do redirections
+    for (struct lex_redir *redir = p->lex->redir_head; redir; redir = redir->next) {
+        // open/get fd by type
+        if (redir->type == LEXRT_PATH_IN)
+            tmpfd = open(redir->source.s, O_RDONLY, REDIR_MODE);
+        else if (redir->type == LEXRT_PATH_OTRUNC)
+            tmpfd = open(redir->source.s, O_CREAT | O_WRONLY | O_TRUNC, REDIR_MODE);
+        else if (redir->type == LEXRT_PATH_OAPPEND)
+            tmpfd = open(redir->source.s, O_CREAT | O_WRONLY | O_APPEND, REDIR_MODE);
+        else if (redir->type == LEXRT_PATH_INOUT)
+            tmpfd = open(redir->source.s, O_CREAT | O_RDWR, REDIR_MODE); // NOTE: bash does not trunc, 
+        else if (redir->type & LEXRT_FD)
+            tmpfd = redir->source.fd;
+        else
+            panic1("invalid redirection");
+
+        // handle errors
+        if (-1 == tmpfd) {
+            if (redir->type & LEXRT_PATH)
+                fprintf(stderr, "%s: %s: %s\n", shname, redir->source.s, strerror(errno));
+            else
+                fprintf(stderr, "%s: redirection to %d failed\n", shname, redir->redir_fd);
+            goto out;
+        }
+
+        // if already target fd, just don't do anything
+        if (tmpfd == redir->redir_fd)
+            continue;
+        
+        // in the end, all redirections are just a dup
+        close(redir->redir_fd);
+        if (redir->redir_fd != fcntl(tmpfd, F_DUPFD, redir->redir_fd)) {
+            fprintf(stderr, "%s: dup: %s\n", shname, strerror(errno));
+            goto out;
+        }
+
+        // if we used open, close it
+        if (redir->type & LEXRT_PATH)
+            close(tmpfd);
+    }
+
+    // resolve argv0 to exe path
+    if (strchr(p->lex->argv[0], '/')) {
+        if (!(exe_path = strdup(p->lex->argv[0]))) {
+            fprintf(stderr, "%s: %s\n", shname, strerror(ENOMEM));
+            goto out;
+        }
+    }
+    else if ((exe_path = resolve_command_path(p->lex->argv[0]))) {
+    }
+    else {
+        fprintf(stderr, "%s: %s: command not found\n", shname, p->lex->argv[0]);
+        goto out;
+    }
+
+    execv(exe_path, p->lex->argv);
+    fprintf(stderr, "%s: %s: %s\n", shname, exe_path, strerror(errno));
+
+out:
+    if (exe_path)
+        free(exe_path);
+    // cleanup for tvm TODO: solve in tvm-level
+    if (p)
+        free_rmsh_proc(p);
+    
+    return 1;
+}
+
 /**
  * consumes ownership of `lexp` even on failure
  */
@@ -1696,37 +1913,31 @@ static int rmsh_launch_proc(struct rmsh *sh, struct lex_proc *lexp, struct rmsh_
     int ret = -1;
     struct rmsh_proc *p = NULL;
 
+    // allocate proc struct and move lexp's ownership to it
     if (!(p = calloc(1, sizeof(*p)))) {
         RMSH_STRERR(sh, ENOMEM);
         goto out;
     }
 
     p->lex = lexp;
+    lexp = NULL;
 
-    if (strchr(lexp->argv[0], '/')) {
-        if (!(p->filename = strdup(lexp->argv[0]))) {
-            RMSH_STRERR(sh, ENOMEM);
-            goto out;
-        }
-    }
-    else if ((p->filename = resolve_command_path(lexp->argv[0]))) {
-    }
-    else {
-        RMSH_ERRFMT(sh, "%s: Command not found", lexp->argv[0]);
-        *out_shp = NULL;
-        free_rmsh_proc(p);
-        ret = 0;
+    if (-1 == (p->pid = fork())) {
+        RMSH_SYSERRMSG(sh, "fork");
         goto out;
     }
 
-    if (-1 == (p->pid = rmsh_exec(sh->shname, p->filename, p->lex->argv)))
-        goto out;
+    if (0 == p->pid) {
+        _exit(rmsh_child(sh->shname, p));
+    }
     
     *out_shp = p;
     ret = 0;
 out:
     if (ret)
         free_rmsh_proc(p);
+    if (lexp)
+        free_lex_proc(lexp);
     return ret;
 }
 
@@ -1746,19 +1957,8 @@ static int rmsh_input(struct rmsh *sh, const char *input)
         goto out;
     }
 
-    printf("----\n");
-    for (char **arg = lexp->argv; *arg; arg++) {
-        printf(" - '%s'\n", *arg);
-    }
-
     if (0 != rmsh_launch_proc(sh, lexp, &shp))
         goto out;
-    
-    // command not found
-    if (!shp) {
-        ret = 0;
-        goto out;
-    }
 
     if (shp->pid != waitpid(shp->pid, &status, 0)) {
         RMSH_SYSERR(sh);
