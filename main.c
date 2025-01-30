@@ -175,6 +175,28 @@ int atol_exact(const char *str, int base, long *out)
     return 0;
 }
 
+/**
+ * returns 1 if `str` (counted by `length`) is a valid name or 0 if it isn't.
+ * a valid name follows the following rules:
+ *  - starts with alphabet or underscore char
+ *  - contains only alphabet, numeric or underscore chars
+ */
+int is_valid_name(const char *str, size_t length)
+{
+    if (!str || length == 0) // null or empty string is invalid
+        return 0;
+
+    if (!isalpha(str[0]) && str[0] != '_') // must start with a letter
+        return 0;
+
+    for (size_t i = 1; i < length; i++) {
+        if (!isalnum(str[i]) && str[i] != '_')
+            return 0;
+    }
+
+    return 1;
+}
+
 /////////////
 // History
 /////////////
@@ -1533,6 +1555,8 @@ struct lex_redir {
 struct lex_proc {
     int    argc;
     char **argv;
+    int    envc;
+    char **envp;
 
     struct lex_redir *redir_head;
     struct lex_redir *redir_tail;
@@ -1547,6 +1571,12 @@ static void free_lex_proc(struct lex_proc *p) {
         free(tmp);
     }
     p->redir_tail = NULL;
+
+    if (p->envp) {
+        for (int i = 0; i < p->envc; i++)
+            free(p->envp[i]);
+        free(p->envp);
+    }
 
     if (p->argv) {
         for (int i = 0; i < p->argc; i++)
@@ -1564,6 +1594,7 @@ static void free_lex_proc(struct lex_proc *p) {
 static int lex_pop_proc(struct lex *lex, struct lex_proc **outp)
 {
     int ret = -1;
+    int done_vars = 0;  // whether we've finished parsing env vars
     struct lex_proc *p = NULL;
     struct lex_tok *tok = NULL;
     struct lex_tok *premeta = NULL;
@@ -1700,6 +1731,23 @@ static int lex_pop_proc(struct lex *lex, struct lex_proc **outp)
         if (!arg)
             continue;
 
+        // parse envp (before argv)
+        if (!done_vars) {
+            char *env_name_end = strchr(arg, '=');
+            if (env_name_end && is_valid_name(arg, (size_t)env_name_end - (size_t)arg)) {
+                // add token to envp
+                if (!(p->envp = realloc(p->envp, (p->envc + 1) * sizeof(char *)))) {
+                    lex_set_error(lex, strerror(ENOMEM));
+                    free(arg);
+                    goto out;
+                }
+                p->envp[p->envc++] = arg;
+                continue;
+            }
+        }
+
+        done_vars = 1;
+
         // add token to argv
         if (!(p->argv = realloc(p->argv, (p->argc + 1) * sizeof(char *)))) {
             lex_set_error(lex, strerror(ENOMEM));
@@ -1715,6 +1763,15 @@ static int lex_pop_proc(struct lex *lex, struct lex_proc **outp)
         goto out;
     }
     p->argv[p->argc++] = NULL;
+
+    // add NULL at the end of argv
+    if (p->envp) {
+        if (!(p->envp = realloc(p->envp, (p->envc + 1) * sizeof(char *)))) {
+            lex_set_error(lex, strerror(ENOMEM));
+            goto out;
+        }
+        p->envp[p->envc++] = NULL;
+    }
 
     *outp = p;
     ret = 0;
@@ -1735,7 +1792,6 @@ out:
 
 /**
  * TODO:
- * . simple commands
  * . pipelines
  * . lists
  * .. && ||
@@ -1803,39 +1859,66 @@ static void free_rmsh_proc(struct rmsh_proc *p) {
     free(p);
 }
 
-/**
- * returns pid or -1 on error;
- */
-static pid_t rmsh_exec(const char *shname, const char *filename, char **argv)
-{
-    pid_t ret = -1;
-    pid_t pid;
-
-    if (-1 == (pid = fork())) {
-        fprintf(stderr, "%s: %s\n", shname, strerror(errno));
-        goto out;
-    }
-
-    if (0 == pid) {
-        execv(filename, argv);
-        fprintf(stderr, "%s: %s: %s\n", shname, filename, strerror(errno));
-        exit(1);
-    }
-
-    ret = pid;
-out:
-    return ret;
-}
-
 #define REDIR_MODE 0666
 
 /**
  * child function
  */
-static int rmsh_child(const char *shname, struct rmsh_proc *p)
+static int rmsh_child(const char *shname, struct rmsh_proc *p, int infile, int outfile)
 {
     int tmpfd;
     char *exe_path = NULL;
+
+    // set the handling for job control signals back to the default
+    struct sigaction sa = { .sa_handler = SIG_DFL };
+    if (0 != sigaction(SIGINT, &sa, NULL)) {
+        fprintf(stderr, "%s: sigaction: %s\n", shname, strerror(errno));
+        goto out;
+    }
+    if (0 != sigaction(SIGQUIT, &sa, NULL)) {
+        fprintf(stderr, "%s: sigaction: %s\n", shname, strerror(errno));
+        goto out;
+    }
+    if (0 != sigaction(SIGTSTP, &sa, NULL)) {
+        fprintf(stderr, "%s: sigaction: %s\n", shname, strerror(errno));
+        goto out;
+    }
+    if (0 != sigaction(SIGTTIN, &sa, NULL)) {
+        fprintf(stderr, "%s: sigaction: %s\n", shname, strerror(errno));
+        goto out;
+    }
+    if (0 != sigaction(SIGTTOU, &sa, NULL)) {
+        fprintf(stderr, "%s: sigaction: %s\n", shname, strerror(errno));
+        goto out;
+    }
+    if (0 != sigaction(SIGCHLD, &sa, NULL)) {
+        fprintf(stderr, "%s: sigaction: %s\n", shname, strerror(errno));
+        goto out;
+    }
+
+    // set the standard input/output of the new process
+    if (infile != STDIN_FILENO)
+    {
+        if (-1 == dup2(infile, STDIN_FILENO)) {
+            fprintf(stderr, "%s: dup2(stdin): %s\n", shname, strerror(errno));
+            goto out;
+        }
+        if (-1 == close(infile)) {
+            fprintf(stderr, "%s: close: %s\n", shname, strerror(errno));
+            goto out;
+        }
+    }
+    if (outfile != STDOUT_FILENO)
+    {
+        if (-1 == dup2(outfile, STDOUT_FILENO)) {
+            fprintf(stderr, "%s: dup2(stdin): %s\n", shname, strerror(errno));
+            goto out;
+        }
+        if (-1 == close(outfile)) {
+            fprintf(stderr, "%s: close: %s\n", shname, strerror(errno));
+            goto out;
+        }
+    }
 
     // do redirections
     for (struct lex_redir *redir = p->lex->redir_head; redir; redir = redir->next) {
@@ -1892,6 +1975,12 @@ static int rmsh_child(const char *shname, struct rmsh_proc *p)
         goto out;
     }
 
+    // add env vars to current process
+    if (p->lex->envp) {
+        for (char **env = p->lex->envp; *env; env++)
+            putenv(*env);
+    }
+
     execv(exe_path, p->lex->argv);
     fprintf(stderr, "%s: %s: %s\n", shname, exe_path, strerror(errno));
 
@@ -1928,7 +2017,7 @@ static int rmsh_launch_proc(struct rmsh *sh, struct lex_proc *lexp, struct rmsh_
     }
 
     if (0 == p->pid) {
-        _exit(rmsh_child(sh->shname, p));
+        _exit(rmsh_child(sh->shname, p, STDIN_FILENO, STDOUT_FILENO));
     }
     
     *out_shp = p;
@@ -1960,10 +2049,11 @@ static int rmsh_input(struct rmsh *sh, const char *input)
     if (0 != rmsh_launch_proc(sh, lexp, &shp))
         goto out;
 
-    if (shp->pid != waitpid(shp->pid, &status, 0)) {
-        RMSH_SYSERR(sh);
-        goto out;
-    }
+    waitpid(shp->pid, &status, 0);
+    // if (shp->pid != waitpid(shp->pid, &status, 0)) {
+    //     RMSH_SYSERR(sh);
+    //     goto out;
+    // }
 
     ret = 0;
 out:
@@ -1994,6 +2084,15 @@ static int interactive(const char *shname, int debug_input) {
             break;
         kill(0, SIGTTIN);
     }
+
+    // ignore interactive and job-control signals
+    struct sigaction sa = { .sa_handler = SIG_IGN };
+    ASSERT_PERROR(sigaction(SIGINT, &sa, NULL) == 0, "sigaction");
+    ASSERT_PERROR(sigaction(SIGQUIT, &sa, NULL) == 0, "sigaction");
+    ASSERT_PERROR(sigaction(SIGTSTP, &sa, NULL) == 0, "sigaction");
+    ASSERT_PERROR(sigaction(SIGTTIN, &sa, NULL) == 0, "sigaction");
+    ASSERT_PERROR(sigaction(SIGTTOU, &sa, NULL) == 0, "sigaction");
+    ASSERT_PERROR(sigaction(SIGCHLD, &sa, NULL) == 0, "sigaction");
 
     // take control of the terminal and get attributes
     setpgid(0, 0); // no checks, if we're session leader, it'll fail with EPERM
