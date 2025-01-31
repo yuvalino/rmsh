@@ -1408,7 +1408,7 @@ static const char *METACHARS = "|&;()<>";
 
 /**
  * returns 0 with `*outp` allocated token on success.
- * if token is to be skipped, the string value (as returned from lex_tok_consume) is NULL.
+ * if EOF was reached, the string value (as returned from lex_tok_consume) is NULL.
  * returns -1 on general error and sets lex->error
  */
 static int lex_pop_token(struct lex *lex, struct lex_tok **outp)
@@ -1564,6 +1564,9 @@ struct lex_proc {
 
 static void free_lex_proc(struct lex_proc *p) {
 
+    if (!p)
+        return;
+    
     while (p->redir_head) {
         struct lex_redir *tmp = p->redir_head;
         p->redir_head = tmp->next;
@@ -1697,10 +1700,21 @@ static int lex_pop_proc(struct lex *lex, struct lex_proc **outp)
                 }
             }
             else {
-                lex_set_error(lex, "metacharacter not supported `%s'", tok->s);
-                goto out;
+                // unknown metacharacter, we'll skip it, maybe our caller can handle it ... ?
+                lex_push_token(lex, tok);
+                tok = NULL;
+
+                // ... unless we have a premeta token, push it (its PREMETA flag was stripped) and re-parse it
+                if (premeta) {
+                    lex_push_token(lex, premeta);
+                    premeta = NULL;
+                    continue;
+                }
+
+                break;
             }
 
+            // having premeta token here just doesn't make sense, we just handled a meta token
             if (premeta)
                 panic2("unattended premeta token", premeta->s);
 
@@ -1783,6 +1797,101 @@ out:
         lex_tok_free(tok);
     if (ret)
         free_lex_proc(p);
+    return ret;
+}
+
+struct lex_pipeline {
+    size_t            proclen;
+    struct lex_proc **procarr;
+};
+
+static void free_lex_pipeline(struct lex_pipeline *p)
+{
+    if (!p)
+        return;
+    
+    if (p->procarr) {
+        for (int i = 0; i < p->proclen; i++)
+            free_lex_proc(p->procarr[i]);
+        free(p->procarr);
+    }
+
+    free(p);
+}
+
+static int lex_pop_pipeline(struct lex *lex, struct lex_pipeline **outp)
+{
+    int ret = -1;
+    struct lex_pipeline *p = NULL;
+    struct lex_proc *next_proc = NULL;
+    struct lex_tok *tok = NULL;
+
+    if (!(p = calloc(1, sizeof(*p)))) {
+        lex_set_error(lex, strerror(ENOMEM));
+        goto out;
+    }
+
+    while (1) {
+        // parse one process
+        if (0 != lex_pop_proc(lex, &next_proc))
+            goto out;
+
+        if (!(p->procarr = realloc(p->procarr, (p->proclen + 1) * sizeof(*p->procarr)))) {
+            lex_set_error(lex, strerror(ENOMEM));
+            goto out;
+        }
+
+        p->procarr[p->proclen++] = next_proc;
+        next_proc = NULL;
+
+        // see if we get a pipe character so we continue to parse
+        if (0 != lex_pop_token(lex, &tok))
+            goto out;
+        
+        // EOF
+        if (!tok->s)
+            break;
+        
+        // doesn't make any sense
+        if ((tok->flags & LEXF_META) == 0)
+            panic2("expected metacharacter", tok->s);
+        
+        // if not a pipeline, push token back and return - maybe caller knows how to parse it?
+        if (0 != strcmp(tok->s, "|")) {
+            // TODO when wish to not throw error
+            lex_set_error(lex, "unexpected metacharacter `%s'", tok->s);
+            goto out;
+            // lex_push_token(lex, tok);
+            // tok = NULL;
+            // break;
+        }
+
+        lex_tok_free(tok);
+        tok = NULL;
+
+        // make sure we have not reached EOF immediately after parsing pipe character
+        if (0 != lex_pop_token(lex, &tok))
+            goto out;
+        if (!tok->s) {
+            lex_set_error(lex, "syntax error: unexpected end of file");
+            goto out;
+        }
+
+        // push back the popped token, it belongs to proc parser and we stole it :(
+        lex_push_token(lex, tok);
+        tok = NULL;
+    }
+
+    *outp = p;
+    ret = 0;
+    
+out:
+    if (tok)
+        lex_tok_free(tok);
+    if (next_proc)
+        free_lex_proc(next_proc);
+    if (ret)
+        free_lex_pipeline(p);
     return ret;
 }
 
@@ -1995,9 +2104,9 @@ out:
 }
 
 /**
- * consumes ownership of `lexp` even on failure
+ * consumes ownership of `p` on success only!
  */
-static int rmsh_launch_proc(struct rmsh *sh, struct lex_proc *lexp, struct rmsh_proc **out_shp)
+static int rmsh_launch_proc(struct rmsh *sh, struct lex_proc *lp, int infile, int outfile, struct rmsh_proc **outp)
 {
     int ret = -1;
     struct rmsh_proc *p = NULL;
@@ -2008,25 +2117,129 @@ static int rmsh_launch_proc(struct rmsh *sh, struct lex_proc *lexp, struct rmsh_
         goto out;
     }
 
-    p->lex = lexp;
-    lexp = NULL;
-
     if (-1 == (p->pid = fork())) {
         RMSH_SYSERRMSG(sh, "fork");
         goto out;
     }
 
+    // from here we can't fail, moves ownership to proc
+    p->lex = lp;
+    lp = NULL;
+
     if (0 == p->pid) {
-        _exit(rmsh_child(sh->shname, p, STDIN_FILENO, STDOUT_FILENO));
+        _exit(rmsh_child(sh->shname, p, infile, outfile));
     }
     
-    *out_shp = p;
+    *outp = p;
     ret = 0;
 out:
     if (ret)
         free_rmsh_proc(p);
-    if (lexp)
-        free_lex_proc(lexp);
+    if (lp)
+        free_lex_proc(lp);
+    return ret;
+}
+
+struct rmsh_job {
+    struct rmsh_proc *proc_head;
+    struct rmsh_proc *proc_tail;
+};
+
+void free_rmsh_job(struct rmsh_job *j)
+{
+    if (!j)
+        return;
+    
+    while (j->proc_head) {
+        struct rmsh_proc *tmp = j->proc_head;
+        j->proc_head = tmp->next;
+        free_rmsh_proc(tmp);
+    }
+
+    free(j);
+}
+
+static int rmsh_launch_job(struct rmsh *sh, struct lex_pipeline *p, struct rmsh_job **outj)
+{
+    int ret = -1;
+    struct rmsh_job *j = NULL;
+    int iopipe[2] = {-1, -1};
+    int infile = STDIN_FILENO;
+    int outfile = -1;
+
+    if (!(j = calloc(1, sizeof(*j)))) {
+        RMSH_STRERR(sh, ENOMEM);
+        goto out;
+    }
+
+    // create and launch procs
+    for (int i = 0; i < p->proclen; i++) {
+        // set up pipes, if necessary
+        if (i < (p->proclen - 1))
+        {
+            if (0 != pipe(iopipe)) {
+                RMSH_STRERRMSG(sh, ENOMEM, "pipe");
+                goto out;
+            }
+            outfile = iopipe[1];
+            iopipe[1] = -1;
+        }
+        else
+            outfile = STDOUT_FILENO;
+
+        // fork the child process
+        struct rmsh_proc *pp;
+        if (0 != rmsh_launch_proc(sh, p->procarr[i], infile, outfile, &pp)) {
+            goto out;
+        }
+
+        p->procarr[i] = NULL; // ownership was moved to `pp`, make sure we don't free twice
+
+        // put proc in job
+        if (j->proc_head) {
+            j->proc_tail->next = pp;
+            j->proc_tail = pp;
+        }
+        else {
+            j->proc_head = j->proc_tail = pp;
+        }
+
+        // TODO
+        // if (shell_is_interactive)
+        // {
+        //     if (!j->pgid)
+        //         j->pgid = pid;
+        //     setpgid (pid, j->pgid);
+        // }
+
+        // clean up after pipes
+        if (infile != STDIN_FILENO && infile != -1) {
+            close(infile);
+            infile = -1;
+        }
+        if (outfile != STDOUT_FILENO && outfile != -1) {
+            close(outfile);
+            outfile = -1;
+        }
+        infile = iopipe[0];
+        iopipe[0] = -1;
+    }
+
+    *outj = j;
+    ret = 0;
+
+out:
+    if (iopipe[0] != -1)
+        close(iopipe[0]);
+    if (iopipe[1] != -1)
+        close(iopipe[1]);
+    if (infile != STDIN_FILENO && infile != -1)
+        close(infile);
+    if (outfile != STDOUT_FILENO && outfile != -1)
+        close(outfile);
+    if (ret)
+        free_rmsh_job(j);
+    free_lex_pipeline(p);
     return ret;
 }
 
@@ -2035,21 +2248,22 @@ static int rmsh_input(struct rmsh *sh, const char *input)
     int ret = -1;
     int status;
     struct lex *lex;
-    struct lex_proc *lexp = NULL;
-    struct rmsh_proc *shp = NULL;
+    struct lex_pipeline *p = NULL;
+    struct rmsh_job *j = NULL;
 
     if (0 != lex_create(input, 1, &lex))
         goto out;
 
-    if (0 != lex_pop_proc(lex, &lexp)) {
+    if (0 != lex_pop_pipeline(lex, &p)) {
         RMSH_ERRFMT(sh, "line %u: %s", lex->line, lex->error ? : strerror(0));
         goto out;
     }
 
-    if (0 != rmsh_launch_proc(sh, lexp, &shp))
+    if (0 != rmsh_launch_job(sh, p, &j))
         goto out;
 
-    waitpid(shp->pid, &status, 0);
+    // TODO properly implement
+    wait(NULL);
     // if (shp->pid != waitpid(shp->pid, &status, 0)) {
     //     RMSH_SYSERR(sh);
     //     goto out;
