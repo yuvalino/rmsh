@@ -1960,6 +1960,7 @@ struct rmsh_proc {
     struct rmsh_proc *next;
     struct lex_proc *lex;
     pid_t pid;
+    int return_status; // -1 if not yet completed
 };
 
 static void free_rmsh_proc(struct rmsh_proc *p) {
@@ -2117,6 +2118,8 @@ static int rmsh_launch_proc(struct rmsh *sh, struct lex_proc *lp, int infile, in
         goto out;
     }
 
+    p->return_status = -1;
+
     if (-1 == (p->pid = fork())) {
         RMSH_SYSERRMSG(sh, "fork");
         goto out;
@@ -2157,6 +2160,58 @@ void free_rmsh_job(struct rmsh_job *j)
     }
 
     free(j);
+}
+
+int wait_rmsh_job(struct rmsh *sh, struct rmsh_job *j)
+{
+    int ret = -1;
+    pid_t pid;
+    int status;
+    struct rmsh_proc *p;
+    int uncompleted_procs = 0;
+
+    // count amount of uncompleted procs
+    for (p = j->proc_head; p; p = p->next) {
+        if (p->return_status == -1)
+            uncompleted_procs++;
+    }
+
+    // wait for all job's processes
+    while (uncompleted_procs) {
+        // wait for next proces to exit
+        int status;
+        if (-1 == (pid = wait(&status))) {
+            fprintf(stderr, "%s: waitpid: %s\n", sh->shname, strerror(errno));
+            goto out;
+        }
+
+        // find processes
+        for (p = j->proc_head; p; p = p->next) {
+            if (p->pid == pid)
+                break;
+        }
+        if (!p) {
+            fprintf(stderr, "%s: waitpid: unknown pid %d\n", sh->shname, pid);
+            goto out;
+        }
+
+        // save exit status
+        if (WIFEXITED(status))
+            p->return_status = WEXITSTATUS(status);
+        else if (WIFSIGNALED(status))
+            p->return_status = 128 + WTERMSIG(status);
+        else {
+            fprintf(stderr, "%s: waitpid: undefined status 0x%08x\n", sh->shname, status);
+            goto out;
+        }
+
+        // one more processes has completed running
+        uncompleted_procs--;
+    }
+
+    ret = 0;
+out:
+    return ret;
 }
 
 static int rmsh_launch_job(struct rmsh *sh, struct lex_pipeline *p, struct rmsh_job **outj)
@@ -2262,12 +2317,8 @@ static int rmsh_input(struct rmsh *sh, const char *input)
     if (0 != rmsh_launch_job(sh, p, &j))
         goto out;
 
-    // TODO properly implement
-    wait(NULL);
-    // if (shp->pid != waitpid(shp->pid, &status, 0)) {
-    //     RMSH_SYSERR(sh);
-    //     goto out;
-    // }
+    if (0 != wait_rmsh_job(sh, j))
+        goto out;
 
     ret = 0;
 out:
@@ -2306,6 +2357,9 @@ static int interactive(const char *shname, int debug_input) {
     ASSERT_PERROR(sigaction(SIGTSTP, &sa, NULL) == 0, "sigaction");
     ASSERT_PERROR(sigaction(SIGTTIN, &sa, NULL) == 0, "sigaction");
     ASSERT_PERROR(sigaction(SIGTTOU, &sa, NULL) == 0, "sigaction");
+
+    // usually set to SIG_IGN too, but right now we don't want it to be like that
+    sa.sa_handler = SIG_DFL;
     ASSERT_PERROR(sigaction(SIGCHLD, &sa, NULL) == 0, "sigaction");
 
     // take control of the terminal and get attributes
