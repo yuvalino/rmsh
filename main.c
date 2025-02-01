@@ -352,7 +352,7 @@ static int prompt_is_search(struct prompt *p) {
 #define GETCHAR(C) do { C = getchar(); ASSERT_PERROR(EOF != C || errno == EINTR, "getchar"); } while (C == EOF)
 #define ECHO_CNTRL(C) printf("^%c", 'A'+C-1)
 
-static int debug_prompt(struct termios *termios_p)
+static int debug_prompt(const struct termios *termios_p)
 {
     int ret = 1;
     struct termios raw_termios;
@@ -1204,7 +1204,7 @@ static const char *__prompt_output(struct prompt *p, struct __termchar *input)
     return NULL;
 }
 
-static const char *prompt(struct prompt *p, struct termios *termios_p)
+static const char *prompt(struct prompt *p, const struct termios *termios_p)
 {
     const char *ret = PRMT_ABRT;
     struct termios raw_termios;
@@ -1929,7 +1929,8 @@ out:
 
 struct rmsh {
     const char *shname;
-    int last_exit_status;
+    struct termios termios;  // saved term attrs
+    pid_t pgid;  // -1 if not interactive, else shell pgid
 };
 
 #define RMSH_STRERR(Sh, Errno) fprintf(stderr, "%s: %s\n", (Sh)->shname, strerror(Errno))
@@ -1943,11 +1944,20 @@ struct rmsh {
 #define RMSH_STRERRFMT(Sh, Errno, Fmt, ...) fprintf(stderr, "%s: " Fmt ": %s\n", (Sh)->shname, ##__VA_ARGS__, strerror(Errno))
 #define RMSH_SYSERRFMT(Sh, Fmt, ...) RMSH_STRERRFMT((Sh), errno, Fmt, ##__VA_ARGS__)
 
-static int rmsh_open(const char *shname, struct rmsh *out_sh)
+static int rmsh_open(const char *shname, int interactive, struct rmsh *out_sh)
 {
     memset(out_sh, 0, sizeof(*out_sh));
     out_sh->shname = shname;
-    out_sh->last_exit_status = 0;
+    out_sh->pgid = -1;
+
+    if (interactive) {
+        out_sh->pgid = getpgid(0);
+        if (out_sh->pgid <= 0) {
+            fprintf(stderr, "%s: getpgid(0): %s\n", shname, strerror(errno));
+            return 1;
+        }
+    }
+
     return 0;
 }
 
@@ -1961,6 +1971,7 @@ struct rmsh_proc {
     struct lex_proc *lex;
     pid_t pid;
     int return_status; // -1 if not yet completed
+    int return_signal; // signal of termination, 0 if exited
 };
 
 static void free_rmsh_proc(struct rmsh_proc *p) {
@@ -1974,10 +1985,39 @@ static void free_rmsh_proc(struct rmsh_proc *p) {
 /**
  * child function
  */
-static int rmsh_child(const char *shname, struct rmsh_proc *p, int infile, int outfile)
+static int rmsh_child(const char *shname, struct rmsh_proc *p, int infile, int outfile, pid_t pgid)
 {
     int tmpfd;
     char *exe_path = NULL;
+
+    // pgid != -1 essentially means an interactive shell
+    // NOTE: this MUST appear before restoring default signal handlers!! `tcsetpgrp` with unignored SIGTTOU causes it to be raised and stop the process
+    if (pgid != -1) {
+        if (pgid == 0)
+            pgid = getpid();
+        
+        // put the process into the process group and give the process group
+        // the terminal, if appropriate. this has to be done both by the shell and in the individual
+        // child processes because of potential race conditions
+        if (0 != setpgid(0, pgid)) {
+            int tmperrno = errno;
+            if (pgid != getpgid(0)) {
+                fprintf(stderr, "%s: setpgid(0, %d): %s\n", shname, pgid, strerror(tmperrno));
+                goto out;
+            }
+        }
+
+        // TODO: only for foreground, currently only foreground is supported
+        if (infile == STDIN_FILENO) {
+            // put process group to terminal foreground
+            if (pgid != tcgetpgrp(infile)) {
+                if (0 != tcsetpgrp(infile, pgid)) {
+                    fprintf(stderr, "%s: tcsetpgrp(%d, %d): %s\n", shname, infile, pgid, strerror(errno));
+                    goto out;
+                }
+            }
+        }
+    }
 
     // set the handling for job control signals back to the default
     struct sigaction sa = { .sa_handler = SIG_DFL };
@@ -2107,7 +2147,7 @@ out:
 /**
  * consumes ownership of `p` on success only!
  */
-static int rmsh_launch_proc(struct rmsh *sh, struct lex_proc *lp, int infile, int outfile, struct rmsh_proc **outp)
+static int rmsh_launch_proc(struct rmsh *sh, struct lex_proc *lp, int infile, int outfile, pid_t pgid, struct rmsh_proc **outp)
 {
     int ret = -1;
     struct rmsh_proc *p = NULL;
@@ -2130,7 +2170,7 @@ static int rmsh_launch_proc(struct rmsh *sh, struct lex_proc *lp, int infile, in
     lp = NULL;
 
     if (0 == p->pid) {
-        _exit(rmsh_child(sh->shname, p, infile, outfile));
+        _exit(rmsh_child(sh->shname, p, infile, outfile, pgid));
     }
     
     *outp = p;
@@ -2146,6 +2186,7 @@ out:
 struct rmsh_job {
     struct rmsh_proc *proc_head;
     struct rmsh_proc *proc_tail;
+    pid_t pgid;
 };
 
 void free_rmsh_job(struct rmsh_job *j)
@@ -2198,8 +2239,10 @@ int wait_rmsh_job(struct rmsh *sh, struct rmsh_job *j)
         // save exit status
         if (WIFEXITED(status))
             p->return_status = WEXITSTATUS(status);
-        else if (WIFSIGNALED(status))
+        else if (WIFSIGNALED(status)) {
             p->return_status = 128 + WTERMSIG(status);
+            p->return_signal = WTERMSIG(status);
+        }
         else {
             fprintf(stderr, "%s: waitpid: undefined status 0x%08x\n", sh->shname, status);
             goto out;
@@ -2208,6 +2251,12 @@ int wait_rmsh_job(struct rmsh *sh, struct rmsh_job *j)
         // one more processes has completed running
         uncompleted_procs--;
     }
+
+    // HACK: when the kernel delivers SIGINT to the foreground job of a terminal
+    //       due to Ctrl+C, it also prints ^C without a trailing newline.
+    //       so print a newline to compensate for the kernel.
+    if (sh->pgid != -1 && j->proc_head != NULL && j->proc_tail->return_signal == SIGINT)
+        putchar('\n');
 
     ret = 0;
 out:
@@ -2227,6 +2276,9 @@ static int rmsh_launch_job(struct rmsh *sh, struct lex_pipeline *p, struct rmsh_
         goto out;
     }
 
+    // -1 means not interactive
+    j->pgid = ((sh->pgid != -1) ? 0 : -1);
+
     // create and launch procs
     for (int i = 0; i < p->proclen; i++) {
         // set up pipes, if necessary
@@ -2244,7 +2296,7 @@ static int rmsh_launch_job(struct rmsh *sh, struct lex_pipeline *p, struct rmsh_
 
         // fork the child process
         struct rmsh_proc *pp;
-        if (0 != rmsh_launch_proc(sh, p->procarr[i], infile, outfile, &pp)) {
+        if (0 != rmsh_launch_proc(sh, p->procarr[i], infile, outfile, j->pgid, &pp)) {
             goto out;
         }
 
@@ -2259,13 +2311,12 @@ static int rmsh_launch_job(struct rmsh *sh, struct lex_pipeline *p, struct rmsh_
             j->proc_head = j->proc_tail = pp;
         }
 
-        // TODO
-        // if (shell_is_interactive)
-        // {
-        //     if (!j->pgid)
-        //         j->pgid = pid;
-        //     setpgid (pid, j->pgid);
-        // }
+        // if interactive shell, make sure we update job's pgid and put new process in correct process pgroup
+        if (sh->pgid != -1) {
+            if (!j->pgid)
+                j->pgid = pp->pid;
+            setpgid(pp->pid, j->pgid);  // NOTE: no error checking, we do this twice (also in child)
+        }
 
         // clean up after pipes
         if (infile != STDIN_FILENO && infile != -1) {
@@ -2320,6 +2371,19 @@ static int rmsh_input(struct rmsh *sh, const char *input)
     if (0 != wait_rmsh_job(sh, j))
         goto out;
 
+    // put shell back in terminal foreground
+    if (sh->pgid != -1) {
+        if (0 != tcsetpgrp(STDIN_FILENO, sh->pgid)) {
+            fprintf(stderr, "%s: tcsetpgrp(0, %d): %s\n", sh->shname, sh->pgid, strerror(errno));
+            goto out;
+        }
+
+        if (0 != tcsetattr(STDIN_FILENO, TCSADRAIN, &sh->termios)) {
+            fprintf(stderr, "%s: tcsetattr(0): %s\n", sh->shname, strerror(errno));
+            goto out;
+        }
+    }
+
     ret = 0;
 out:
     if (lex)
@@ -2333,19 +2397,17 @@ out:
 
 static int interactive(const char *shname, int debug_input) {
     int ret = 1;
-    struct termios termios;
-    pid_t shpgid;
     struct prompt prmt = {0};
-    struct rmsh sh = {0};
+    struct rmsh sh;
 
-    shpgid = getpgrp();
-    ASSERT_PERROR(shpgid > 0, "getpgrp");
+    if (0 != rmsh_open(shname, 1, &sh))
+        goto out;
 
     // loop until we are in the foreground
     while (1) {
         pid_t pgid = tcgetpgrp(STDIN_FILENO);
         ASSERT_PERROR(pgid > 0, "tcgetpgrp");
-        if (pgid == shpgid)
+        if (pgid == sh.pgid)
             break;
         kill(0, SIGTTIN);
     }
@@ -2364,19 +2426,16 @@ static int interactive(const char *shname, int debug_input) {
 
     // take control of the terminal and get attributes
     setpgid(0, 0); // no checks, if we're session leader, it'll fail with EPERM
-    ASSERT_PERROR(tcsetpgrp(STDIN_FILENO, shpgid) == 0, "tcsetpgrp");
-    ASSERT_PERROR(tcgetattr(STDIN_FILENO, &termios) == 0, "tcgetattr");
+    ASSERT_PERROR(tcsetpgrp(STDIN_FILENO, sh.pgid) == 0, "tcsetpgrp");
+    ASSERT_PERROR(tcgetattr(STDIN_FILENO, &sh.termios) == 0, "tcgetattr");
 
     if (debug_input) {
-        debug_prompt(&termios);
+        debug_prompt(&sh.termios);
         goto out;
     }
-    
-    if (0 != rmsh_open(shname, &sh))
-        goto out;
 
     while (1) {
-        const char *in = prompt(&prmt, &termios);
+        const char *in = prompt(&prmt, &sh.termios);
         if (!in)
             continue;
         if (PRMT_EXIT == in)
@@ -2405,7 +2464,7 @@ static int noninteractive(const char *shname, const char *command) {
     int ret = 1;
     struct rmsh sh = {0};
 
-    if (0 != rmsh_open(shname, &sh))
+    if (0 != rmsh_open(shname, 0, &sh))
         goto out;
 
     if (0 != rmsh_input(&sh, command))
