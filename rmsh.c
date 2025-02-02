@@ -1436,6 +1436,20 @@ static int lex_pop_token(struct lex *lex, struct lex_tok **outp)
 
     for (; CURR; lex->cursor++) {
 
+        // lines counter
+        // TODO: this really should be handled differently, since the new line may not be parsed
+        if (CURR == '\n')
+            lex->line++;
+
+        // ifs: skip if didn't parse anything yet, else break and return whatever we parsed so far
+        if (strchr(IFS, CURR)) {
+            if (!done_ifs)
+                continue;
+            break;
+        }
+
+        done_ifs = 1;
+
         // parse meta characters together, split words
         if (strchr(METACHARS, CURR)) {
             // if a word is already constructing, break but mark it as PREMETA
@@ -1456,19 +1470,6 @@ static int lex_pop_token(struct lex *lex, struct lex_tok **outp)
         // if constructing a metacharactered word, make sure to cut it first
         if (tok->flags & LEXF_META)
             break;
-
-        // lines counter
-        if (CURR == '\n')
-            lex->line++;
-
-        // ifs: skip if didn't parse anything yet, else break and return whatever we parsed so far
-        if (strchr(IFS, CURR)) {
-            if (!done_ifs)
-                continue;
-            break;
-        }
-
-        done_ifs = 1;
 
         // handle quoted strings
         if (CURR == '\'' || CURR == '"') {
@@ -1502,7 +1503,7 @@ static int lex_pop_token(struct lex *lex, struct lex_tok **outp)
         if (0 != lex_token_insert(lex, tok, '\0'))
             goto out;
     }
-    
+
     if (outp)
         *outp = tok;
     ret = 0;
